@@ -821,6 +821,24 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_resultsScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
 	_resultsScroll.hasVerticalScroller = YES;
 	_resultsTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+	NSTableColumn *closeColumn = [[NSTableColumn alloc] initWithIdentifier:@"close"];
+	closeColumn.title = @"";
+	closeColumn.width = 28;
+	closeColumn.minWidth = 28;
+	closeColumn.maxWidth = 36;
+	closeColumn.resizingMask = NSTableColumnNoResizing;
+	closeColumn.editable = YES;
+	NSButtonCell *closeCell = [[NSButtonCell alloc] init];
+	closeCell.buttonType = NSButtonTypeMomentaryPushIn;
+	closeCell.bezelStyle = NSBezelStyleInline;
+	closeCell.bordered = NO;
+	closeCell.imagePosition = NSNoImage;
+	closeCell.title = @"×";
+	closeCell.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
+	closeCell.target = self;
+	closeCell.action = @selector(closeSearchHit:);
+	closeColumn.dataCell = closeCell;
+	[_resultsTable addTableColumn:closeColumn];
 	for (NSArray *columnInfo in @[@[@"file", @"Path", @520], @[@"line", @"Line", @60], @[@"text", @"Text", @480]]) {
 		NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:columnInfo[0]];
 		column.title = columnInfo[1];
@@ -1963,8 +1981,41 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self setStatusText:[NSString stringWithFormat:@"Replace in Files: %ld replacement(s) in %ld file(s).%@", (long)(result.replacements + editorReplacements), (long)(result.filesChanged + editorFiles), result.error.length ? [@" " stringByAppendingString:result.error] : @""]];
 }
 
+- (void)closeSearchHit:(id)sender {
+	(void)sender;
+	NSInteger row = _resultsTable.clickedRow;
+	if (row < 0) {
+		row = _resultsTable.selectedRow;
+	}
+	if (row < 0 || row >= (NSInteger)_hits.count) {
+		return;
+	}
+	NSString *path = _hits[row].path ?: @"";
+	DocumentTab *document = path.length ? [self documentForPath:path] : nil;
+	if (document) {
+		NSTabViewItem *item = [self itemForDocument:document];
+		if (item) {
+			[_tabs selectTabViewItem:item];
+		}
+		[self closeDocument:nil];
+		if ([self documentForPath:path]) {
+			return;
+		}
+	}
+	[_hits removeObjectAtIndex:(NSUInteger)row];
+	[_resultsTable reloadData];
+	[self sizeResultColumns];
+}
+
 - (void)openSearchHit:(id)sender {
 	(void)sender;
+	NSInteger clickedColumn = _resultsTable.clickedColumn;
+	if (clickedColumn >= 0 && clickedColumn < (NSInteger)_resultsTable.tableColumns.count) {
+		NSTableColumn *column = _resultsTable.tableColumns[clickedColumn];
+		if ([column.identifier isEqualToString:@"close"]) {
+			return;
+		}
+	}
 	NSInteger row = _resultsTable.clickedRow;
 	if (row < 0) {
 		row = _resultsTable.selectedRow;
@@ -2000,6 +2051,13 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[_window makeFirstResponder:document.editor];
 }
 
+- (BOOL)tableView:(NSTableView *)tableView shouldTrackCell:(NSCell *)cell forTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+	(void)tableView;
+	(void)cell;
+	(void)row;
+	return [tableColumn.identifier isEqualToString:@"close"];
+}
+
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
 	(void)tableView;
 	return (NSInteger)_hits.count;
@@ -2011,6 +2069,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		return @"";
 	}
 	NppFindHit *hit = _hits[row];
+	if ([column.identifier isEqualToString:@"close"]) {
+		return @"×";
+	}
 	if ([column.identifier isEqualToString:@"line"]) {
 		return [NSString stringWithFormat:@"%ld", (long)hit.line];
 	}
@@ -2024,8 +2085,10 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)tableView;
 	(void)cell;
 	(void)rect;
-	(void)tableColumn;
 	(void)mouseLocation;
+	if ([tableColumn.identifier isEqualToString:@"close"]) {
+		return @"Close";
+	}
 	if (row < 0 || row >= (NSInteger)_hits.count) {
 		return @"";
 	}
