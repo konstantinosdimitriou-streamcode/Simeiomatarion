@@ -11,6 +11,7 @@
 
 @protocol DocumentTabDelegate <NSObject>
 - (void)documentTabDidChange:(DocumentTab *)tab;
+- (void)documentTabDidScroll:(DocumentTab *)tab;
 - (void)documentTab:(DocumentTab *)tab insertedText:(NSString *)text at:(NSInteger)position;
 - (void)documentTab:(DocumentTab *)tab deletedText:(NSString *)text at:(NSInteger)position;
 @end

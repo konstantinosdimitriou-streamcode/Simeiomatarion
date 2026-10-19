@@ -301,7 +301,13 @@ static int KeywordIndex(NSString *name) {
 		[self.editor message:SCI_TOGGLEFOLD wParam:(uptr_t)line lParam:0];
 	} else if (notification->nmhdr.code == SCN_UPDATEUI) {
 		[self highlightBraces];
-		[self.delegate documentTabDidChange:self];
+		int updated = notification->updated;
+		if ((updated & SC_UPDATE_V_SCROLL) && [self.delegate respondsToSelector:@selector(documentTabDidScroll:)]) {
+			[self.delegate documentTabDidScroll:self];
+		}
+		if (updated & (SC_UPDATE_CONTENT | SC_UPDATE_SELECTION)) {
+			[self.delegate documentTabDidChange:self];
+		}
 	}
 }
 

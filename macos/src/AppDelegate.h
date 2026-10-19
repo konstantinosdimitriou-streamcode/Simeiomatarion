@@ -4,7 +4,7 @@
 
 @class DocumentTab;
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate>
 - (DocumentTab *)currentDocument;
 - (NSString *)selectedText;
 - (void)replaceSelection:(NSString *)text;

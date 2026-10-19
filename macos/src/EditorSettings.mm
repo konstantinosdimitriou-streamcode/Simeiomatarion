@@ -18,6 +18,9 @@
 		@"close": @"cmd+w",
 		@"closeAll": @"cmd+shift+w",
 		@"print": @"cmd+p",
+		@"quickOpen": @"cmd+shift+o",
+		@"openFolder": @"cmd+alt+o",
+		@"reveal": @"cmd+alt+r",
 		@"undo": @"cmd+z",
 		@"redo": @"cmd+shift+z",
 		@"cut": @"cmd+x",
@@ -66,6 +69,9 @@
 	settings.wrap = NO;
 	settings.lineNumbers = YES;
 	settings.showWhitespace = NO;
+	settings.theme = @"system";
+	settings.syncScroll = NO;
+	settings.confirmClose = YES;
 	settings.shortcuts = [EditorSettings defaultShortcuts];
 	NSData *data = [NSData dataWithContentsOfURL:url];
 	if (!data) {
@@ -89,6 +95,9 @@
 	if (json[@"wrap"]) settings.wrap = [json[@"wrap"] boolValue];
 	if (json[@"lineNumbers"]) settings.lineNumbers = [json[@"lineNumbers"] boolValue];
 	if (json[@"showWhitespace"]) settings.showWhitespace = [json[@"showWhitespace"] boolValue];
+	if ([json[@"theme"] isKindOfClass:[NSString class]]) settings.theme = json[@"theme"];
+	if (json[@"syncScroll"]) settings.syncScroll = [json[@"syncScroll"] boolValue];
+	if (json[@"confirmClose"] != nil) settings.confirmClose = [json[@"confirmClose"] boolValue];
 	if ([json[@"shortcutVersion"] integerValue] >= 2 && [json[@"shortcuts"] isKindOfClass:[NSDictionary class]]) {
 		NSMutableDictionary *merged = [settings.shortcuts mutableCopy];
 		[merged addEntriesFromDictionary:json[@"shortcuts"]];
@@ -106,6 +115,9 @@
 		@"wrap": @(self.wrap),
 		@"lineNumbers": @(self.lineNumbers),
 		@"showWhitespace": @(self.showWhitespace),
+		@"theme": self.theme ?: @"system",
+		@"syncScroll": @(self.syncScroll),
+		@"confirmClose": @(self.confirmClose),
 		@"shortcutVersion": @2,
 		@"shortcuts": self.shortcuts ?: @{}
 	};

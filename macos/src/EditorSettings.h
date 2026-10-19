@@ -10,6 +10,9 @@
 @property (nonatomic, assign) BOOL wrap;
 @property (nonatomic, assign) BOOL lineNumbers;
 @property (nonatomic, assign) BOOL showWhitespace;
+@property (nonatomic, copy) NSString *theme;
+@property (nonatomic, assign) BOOL syncScroll;
+@property (nonatomic, assign) BOOL confirmClose;
 @property (nonatomic, copy) NSDictionary<NSString *, NSString *> *shortcuts;
 + (instancetype)loadFromURL:(NSURL *)url;
 - (BOOL)saveToURL:(NSURL *)url error:(NSError **)error;
