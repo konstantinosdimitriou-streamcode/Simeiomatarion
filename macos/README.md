@@ -27,6 +27,7 @@ open "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos/buil
 ## What you can do
 
 - Edit several documents in tabs
+- Drag one or more files onto the window, or onto the Dock icon, to open each in a tab
 - Syntax highlighting and code folding through Lexilla, using `langs.model.xml` from this Notepad++ release
 - Find, find previous, replace, and replace all
 - Regular expressions through the same Boost.Regex search Notepad++ uses (`SCFIND_REGEXP | SCFIND_POSIX`)

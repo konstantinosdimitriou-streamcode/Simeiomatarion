@@ -48,11 +48,93 @@ static NSURL *SupportDirectory(void) {
 @property (nonatomic, strong) NSView *status;
 @property (nonatomic, assign) BOOL findVisible;
 @property (nonatomic, assign) BOOL resultsVisible;
+@property (nonatomic, weak) AppDelegate *dropOwner;
 - (void)layoutPanes;
+@end
+
+@interface AppDelegate (DroppedFiles)
+- (BOOL)openDroppedPaths:(NSArray<NSString *> *)paths;
+@end
+
+@interface NppDropOverlay : NSView
+@end
+
+@implementation NppDropOverlay
+- (NSView *)hitTest:(NSPoint)point {
+	(void)point;
+	return nil;
+}
 @end
 
 @implementation WorkspaceView {
 	BOOL _layingOut;
+	NppDropOverlay *_dropOverlay;
+}
+- (instancetype)initWithFrame:(NSRect)frameRect {
+	self = [super initWithFrame:frameRect];
+	if (self) {
+		[self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+	}
+	return self;
+}
+- (NSArray<NSString *> *)droppedFilePaths:(id<NSDraggingInfo>)sender {
+	NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[[NSURL class]] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+	NSMutableArray<NSString *> *paths = [NSMutableArray array];
+	NSFileManager *files = [NSFileManager defaultManager];
+	for (NSURL *url in urls) {
+		if (!url.isFileURL || url.path.length == 0) {
+			continue;
+		}
+		BOOL directory = NO;
+		if ([files fileExistsAtPath:url.path isDirectory:&directory] && !directory) {
+			[paths addObject:url.path];
+		}
+	}
+	return paths;
+}
+- (void)setDropHighlight:(BOOL)highlight {
+	if (highlight) {
+		if (!_dropOverlay) {
+			_dropOverlay = [[NppDropOverlay alloc] initWithFrame:self.bounds];
+			_dropOverlay.wantsLayer = YES;
+			_dropOverlay.layer.borderWidth = 3;
+			_dropOverlay.layer.borderColor = NSColor.controlAccentColor.CGColor;
+			_dropOverlay.layer.backgroundColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.12].CGColor;
+		}
+		_dropOverlay.frame = self.bounds;
+		[self addSubview:_dropOverlay positioned:NSWindowAbove relativeTo:nil];
+	} else {
+		[_dropOverlay removeFromSuperview];
+	}
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+	if ([self droppedFilePaths:sender].count == 0) {
+		return NSDragOperationNone;
+	}
+	[self setDropHighlight:YES];
+	return NSDragOperationCopy;
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+	return [self droppedFilePaths:sender].count == 0 ? NSDragOperationNone : NSDragOperationCopy;
+}
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+	(void)sender;
+	[self setDropHighlight:NO];
+}
+- (void)draggingEnded:(id<NSDraggingInfo>)sender {
+	(void)sender;
+	[self setDropHighlight:NO];
+}
+- (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
+	return [self droppedFilePaths:sender].count > 0;
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+	NSArray<NSString *> *paths = [self droppedFilePaths:sender];
+	[self setDropHighlight:NO];
+	if (paths.count == 0) {
+		return NO;
+	}
+	return [self.dropOwner openDroppedPaths:paths];
 }
 - (void)setFrameSize:(NSSize)newSize {
 	[super setFrameSize:newSize];
@@ -104,6 +186,10 @@ static NSURL *SupportDirectory(void) {
 	[self addSubview:self.results positioned:NSWindowAbove relativeTo:self.tabs];
 	[self addSubview:self.findBar positioned:NSWindowAbove relativeTo:self.results];
 	[self addSubview:self.status positioned:NSWindowAbove relativeTo:self.findBar];
+	if (_dropOverlay.superview == self) {
+		_dropOverlay.frame = bounds;
+		[self addSubview:_dropOverlay positioned:NSWindowAbove relativeTo:nil];
+	}
 	_layingOut = NO;
 }
 @end
@@ -175,6 +261,7 @@ static NSURL *SupportDirectory(void) {
 	EditorSettings *_settings;
 	MacroStore *_macro;
 	NSMutableArray<DocumentTab *> *_documents;
+	NSMutableArray<NSString *> *_pendingOpenPaths;
 	NSInteger _untitled;
 	NSTimer *_recoveryTimer;
 	NSTimer *_fileWatchTimer;
@@ -284,7 +371,15 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self buildMenus];
 	[self loadPlugins];
 	[self buildMenus];
-	if (![self openArguments]) {
+	BOOL opened = [self openArguments];
+	if (_pendingOpenPaths.count > 0) {
+		NSArray<NSString *> *pending = [_pendingOpenPaths copy];
+		[_pendingOpenPaths removeAllObjects];
+		if ([self openDroppedPaths:pending]) {
+			opened = YES;
+		}
+	}
+	if (!opened) {
 		if (![self restoreSession]) {
 			[self offerRecovery];
 		}
@@ -478,6 +573,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_window.restorable = NO;
 	_window.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace;
 	_workspace = [[WorkspaceView alloc] initWithFrame:_window.contentView.bounds];
+	_workspace.dropOwner = self;
 	_workspace.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 	_workspace.translatesAutoresizingMaskIntoConstraints = YES;
 	_tabs = [[NSTabView alloc] initWithFrame:NSZeroRect];
@@ -1249,6 +1345,41 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return YES;
 }
 
+- (BOOL)openDroppedPaths:(NSArray<NSString *> *)paths {
+	if (!_window || !_documents) {
+		if (!_pendingOpenPaths) {
+			_pendingOpenPaths = [NSMutableArray array];
+		}
+		[_pendingOpenPaths addObjectsFromArray:paths];
+		return paths.count > 0;
+	}
+	BOOL opened = NO;
+	for (NSString *path in paths) {
+		BOOL directory = NO;
+		if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&directory] || directory) {
+			continue;
+		}
+		DocumentTab *existing = [self documentForPath:path];
+		if (existing) {
+			NSTabViewItem *item = [self itemForDocument:existing];
+			if (item) {
+				[_tabs selectTabViewItem:item];
+				[self rebuildTabStrip];
+				opened = YES;
+			}
+			continue;
+		}
+		if ([self openPath:path]) {
+			opened = YES;
+		}
+	}
+	if (opened) {
+		[NSApp activateIgnoringOtherApps:YES];
+		[_window makeKeyAndOrderFront:nil];
+	}
+	return opened;
+}
+
 - (void)openDocument:(id)sender {
 	(void)sender;
 	NSOpenPanel *panel = [NSOpenPanel openPanel];
@@ -1756,8 +1887,15 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (DocumentTab *)documentForPath:(NSString *)path {
+	if (path.length == 0) {
+		return nil;
+	}
+	NSString *standard = path.stringByStandardizingPath;
 	for (DocumentTab *document in _documents) {
-		if ([document.path isEqualToString:path]) {
+		if (document.path.length == 0) {
+			continue;
+		}
+		if ([document.path.stringByStandardizingPath isEqualToString:standard]) {
 			return document;
 		}
 	}
@@ -2855,10 +2993,16 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (BOOL)application:(NSApplication *)sender openFile:(NSString *)filename {
 	(void)sender;
-	if (!_window) {
+	if (filename.length == 0) {
 		return NO;
 	}
-	return [self openPath:filename];
+	return [self openDroppedPaths:@[filename]];
+}
+
+- (void)application:(NSApplication *)sender openFiles:(NSArray<NSString *> *)filenames {
+	(void)sender;
+	[self openDroppedPaths:filenames];
+	[NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
 }
 
 @end
