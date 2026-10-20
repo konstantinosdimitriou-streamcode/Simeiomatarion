@@ -52,6 +52,50 @@ long NppFind(ScintillaView *editor, NSString *text, bool forward, bool wrap, Sea
 	return found;
 }
 
+static const int kSearchIndicator = 9;
+
+void NppClearSearchHighlights(ScintillaView *editor) {
+	if (!editor) {
+		return;
+	}
+	long length = [editor message:SCI_GETLENGTH];
+	[editor message:SCI_SETINDICATORCURRENT wParam:kSearchIndicator lParam:0];
+	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+}
+
+void NppHighlightMatches(ScintillaView *editor, NSString *text, SearchFlags flags) {
+	NppClearSearchHighlights(editor);
+	if (!editor || text.length == 0) {
+		return;
+	}
+	[editor message:SCI_INDICSETSTYLE wParam:kSearchIndicator lParam:INDIC_STRAIGHTBOX];
+	[editor message:SCI_INDICSETFORE wParam:kSearchIndicator lParam:0xFFAA44];
+	[editor message:SCI_INDICSETALPHA wParam:kSearchIndicator lParam:70];
+	[editor message:SCI_SETINDICATORCURRENT wParam:kSearchIndicator lParam:0];
+	const char *bytes = text.UTF8String;
+	long byteLength = static_cast<long>(strlen(bytes ?: ""));
+	if (byteLength <= 0) {
+		return;
+	}
+	long documentLength = [editor message:SCI_GETLENGTH];
+	[editor message:SCI_SETSEARCHFLAGS wParam:static_cast<uptr_t>(NppSearchFlags(flags)) lParam:0];
+	long start = 0;
+	for (int count = 0; count < 2000 && start <= documentLength; count++) {
+		long found = SearchRange(editor, bytes, byteLength, start, documentLength);
+		if (found < 0) {
+			break;
+		}
+		long matchStart = [editor message:SCI_GETTARGETSTART];
+		long matchEnd = [editor message:SCI_GETTARGETEND];
+		if (matchEnd <= matchStart) {
+			start = matchStart + 1;
+			continue;
+		}
+		[editor message:SCI_INDICATORFILLRANGE wParam:static_cast<uptr_t>(matchStart) lParam:matchEnd - matchStart];
+		start = matchEnd;
+	}
+}
+
 static void ReplaceTarget(ScintillaView *editor, NSString *replacement, bool regex) {
 	const char *bytes = replacement.UTF8String ?: "";
 	long length = static_cast<long>(strlen(bytes));
@@ -252,6 +296,53 @@ static NSString *ReplaceDocument(NSString *text, NSString *query, NSString *repl
 	return [lines componentsJoinedByString:@"\n"];
 }
 
+static BOOL SearchOneFile(NSURL *url, NSString *query, SearchFlags flags, NSInteger limit, NSMutableArray<NppFindHit *> *hits, NSString **error) {
+	NSData *data = [NSData dataWithContentsOfURL:url];
+	if (!data.length || (NSInteger)hits.count >= limit) {
+		return YES;
+	}
+	const uint8_t *bytes = (const uint8_t *)data.bytes;
+	NSUInteger probe = MIN(data.length, (NSUInteger)8192);
+	for (NSUInteger index = 0; index < probe; index++) {
+		if (bytes[index] == 0) {
+			return YES;
+		}
+	}
+	NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+	if (!text) {
+		text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+	}
+	if (!text) {
+		return YES;
+	}
+	NSInteger lineNumber = 0;
+	for (NSString *rawLine in [text componentsSeparatedByString:@"\n"]) {
+		NSString *line = [rawLine hasSuffix:@"\r"] ? [rawLine substringToIndex:rawLine.length - 1] : rawLine;
+		lineNumber++;
+		NSMutableArray<NSValue *> *matches = [NSMutableArray array];
+		CollectMatches(line, query, flags, matches, error);
+		if (error && *error) {
+			return NO;
+		}
+		for (NSValue *value in matches) {
+			NSRange found = value.rangeValue;
+			NSString *prefix = found.location > 0 ? [line substringToIndex:found.location] : @"";
+			NSString *match = [line substringWithRange:found];
+			NppFindHit *hit = [NppFindHit new];
+			hit.path = url.path;
+			hit.line = lineNumber;
+			hit.lineText = line;
+			hit.byteOffset = (NSInteger)[prefix lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+			hit.byteLength = (NSInteger)[match lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+			[hits addObject:hit];
+			if ((NSInteger)hits.count >= limit) {
+				return YES;
+			}
+		}
+	}
+	return YES;
+}
+
 NSArray<NppFindHit *> *NppFindInFiles(NSString *directory, NSString *query, NSString *filters, BOOL subfolders, SearchFlags flags, NSInteger limit) {
 	if (directory.length == 0 || query.length == 0 || limit <= 0) {
 		return @[];
@@ -274,56 +365,133 @@ NSArray<NppFindHit *> *NppFindInFiles(NSString *directory, NSString *query, NSSt
 			continue;
 		}
 		scanned++;
-		NSData *data = [NSData dataWithContentsOfURL:url];
-		if (!data.length) {
-			continue;
-		}
-		const uint8_t *bytes = (const uint8_t *)data.bytes;
-		NSUInteger probe = MIN(data.length, (NSUInteger)8192);
-		BOOL binary = NO;
-		for (NSUInteger index = 0; index < probe; index++) {
-			if (bytes[index] == 0) {
-				binary = YES;
-				break;
-			}
-		}
-		if (binary) {
-			continue;
-		}
-		NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-		if (!text) {
-			text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
-		}
-		if (!text) {
-			continue;
-		}
-		NSInteger lineNumber = 0;
-		for (NSString *rawLine in [text componentsSeparatedByString:@"\n"]) {
-			NSString *line = [rawLine hasSuffix:@"\r"] ? [rawLine substringToIndex:rawLine.length - 1] : rawLine;
-			lineNumber++;
-			NSMutableArray<NSValue *> *matches = [NSMutableArray array];
-			CollectMatches(line, query, flags, matches, nil);
-			for (NSValue *value in matches) {
-				NSRange found = value.rangeValue;
-				NSString *prefix = found.location > 0 ? [line substringToIndex:found.location] : @"";
-				NSString *match = [line substringWithRange:found];
-				NppFindHit *hit = [NppFindHit new];
-				hit.path = url.path;
-				hit.line = lineNumber;
-				hit.lineText = line;
-				hit.byteOffset = (NSInteger)[prefix lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-				hit.byteLength = (NSInteger)[match lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-				[hits addObject:hit];
-				if ((NSInteger)hits.count >= limit) {
-					break;
-				}
-			}
-			if ((NSInteger)hits.count >= limit) {
-				break;
-			}
+		NSString *error = nil;
+		if (!SearchOneFile(url, query, flags, limit, hits, &error) || error) {
+			break;
 		}
 	}
 	return hits;
+}
+
+@implementation NppFindScan
+@end
+
+@implementation NppFindScanToken
+- (void)cancel {
+	self.cancelled = YES;
+}
+@end
+
+NppFindScanToken *NppStartFindInFiles(NSString *directory, NSString *query, NSString *filters, BOOL subfolders, SearchFlags flags, NSInteger limit, void (^handler)(NppFindScan *scan)) {
+	NppFindScanToken *token = [NppFindScanToken new];
+	if (!handler) {
+		return token;
+	}
+	NSString *root = [directory copy] ?: @"";
+	NSString *needle = [query copy] ?: @"";
+	NSString *pattern = [filters copy] ?: @"";
+	NSInteger cap = limit;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSLock *lock = [NSLock new];
+		NSMutableArray<NppFindHit *> *pending = [NSMutableArray array];
+		__block NSInteger scanned = 0;
+		__block NSString *current = @"";
+		__block BOOL scheduled = NO;
+		__block BOOL ended = NO;
+		__block BOOL limited = NO;
+		__block NSString *failure = nil;
+		void (^schedule)(void) = ^{
+			BOOL start = NO;
+			[lock lock];
+			if (!scheduled) {
+				scheduled = YES;
+				start = YES;
+			}
+			[lock unlock];
+			if (!start) {
+				return;
+			}
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+				NSArray<NppFindHit *> *batch = nil;
+				NSInteger count = 0;
+				NSString *path = nil;
+				BOOL done = NO;
+				BOOL stopped = NO;
+				BOOL hitLimit = NO;
+				NSString *error = nil;
+				[lock lock];
+				batch = [pending copy];
+				[pending removeAllObjects];
+				count = scanned;
+				path = [current copy];
+				done = ended;
+				stopped = token.cancelled;
+				hitLimit = limited;
+				error = failure;
+				scheduled = NO;
+				[lock unlock];
+				NppFindScan *scan = [NppFindScan new];
+				scan.hits = batch ?: @[];
+				scan.scanned = count;
+				scan.path = path ?: @"";
+				scan.finished = done;
+				scan.cancelled = done && stopped;
+				scan.limited = done && hitLimit;
+				scan.error = error;
+				handler(scan);
+			});
+		};
+		if (root.length == 0 || needle.length == 0 || cap <= 0) {
+			[lock lock];
+			ended = YES;
+			failure = @"Enter the text to find and a folder that exists.";
+			[lock unlock];
+			schedule();
+			return;
+		}
+		NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtURL:[NSURL fileURLWithPath:root] includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLFileSizeKey] options:subfolders ? 0 : NSDirectoryEnumerationSkipsSubdirectoryDescendants errorHandler:nil];
+		NSInteger seen = 0;
+		NSInteger total = 0;
+		for (NSURL *url in enumerator) {
+			if (token.cancelled || total >= cap || seen >= 20000) {
+				break;
+			}
+			NSNumber *regular = nil;
+			NSNumber *size = nil;
+			[url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+			[url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+			if (!regular.boolValue || size.unsignedLongLongValue > 8 * 1024 * 1024 || !NameMatches(url.lastPathComponent, pattern)) {
+				continue;
+			}
+			NSMutableArray<NppFindHit *> *fileHits = [NSMutableArray array];
+			NSString *error = nil;
+			SearchOneFile(url, needle, flags, cap - total, fileHits, &error);
+			seen++;
+			total += (NSInteger)fileHits.count;
+			[lock lock];
+			scanned = seen;
+			current = url.lastPathComponent ?: @"";
+			if (error) {
+				failure = error;
+				ended = YES;
+			} else if (fileHits.count) {
+				[pending addObjectsFromArray:fileHits];
+			}
+			[lock unlock];
+			schedule();
+			if (error) {
+				return;
+			}
+		}
+		[lock lock];
+		if (total >= cap || seen >= 20000) {
+			limited = !token.cancelled;
+		}
+		ended = YES;
+		[lock unlock];
+		schedule();
+	});
+	return token;
 }
 
 @implementation NppReplaceFilesResult

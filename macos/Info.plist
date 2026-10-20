@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>Notepad++</string>
+	<string>Simeiomatarion</string>
 	<key>CFBundleDisplayName</key>
-	<string>Notepad++</string>
+	<string>Simeiomatarion</string>
 	<key>CFBundleIdentifier</key>
 	<string>org.notepad-plus-plus.macos</string>
 	<key>CFBundleVersion</key>

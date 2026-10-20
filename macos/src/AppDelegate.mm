@@ -1,13 +1,25 @@
 #import "AppDelegate.h"
 
+#import "ClipboardHistory.h"
 #import "DocumentTab.h"
 #import "EditorActions.h"
 #import "EditorSettings.h"
 #import "Encoding.h"
 #import "LangCatalog.h"
+#import "Localization.h"
 #import "MacroStore.h"
+#import "MinimapView.h"
 #import "NppMacPlugin.h"
+#import "OfficeOpen.h"
+#import "OutlineIndex.h"
+#import "PreviewHTML.h"
 #import "Search.h"
+#import "SnippetStore.h"
+#import "TextTools.h"
+#import "UserLanguages.h"
+
+#import <PDFKit/PDFKit.h>
+#import <WebKit/WebKit.h>
 
 #include <dlfcn.h>
 
@@ -19,11 +31,15 @@
 static NSString *const NppTabDragType = @"npp.document.tab";
 
 @interface AppDelegate (TabDrag)
+- (void)forceCloseTab:(DocumentTab *)document fromView:(NSView *)view;
 - (void)noteTabDragStarted:(DocumentTab *)document;
 - (void)noteTabDragEnded;
+- (void)moveDocumentToNewWindow:(DocumentTab *)document;
 - (DocumentTab *)draggedTabDocument;
 - (void)moveDocument:(DocumentTab *)document toPane:(NSInteger)pane atIndex:(NSInteger)index;
 - (void)showDocument:(DocumentTab *)document inPane:(NSInteger)pane;
+- (BOOL)canSplitDocument:(DocumentTab *)document besidePane:(NSInteger)pane onRight:(BOOL)onRight;
+- (BOOL)splitDocument:(DocumentTab *)document besidePane:(NSInteger)pane onRight:(BOOL)onRight;
 @end
 
 @interface NppTabButton : NSButton <NSDraggingSource>
@@ -40,6 +56,13 @@ static NSString *const NppTabDragType = @"npp.document.tab";
 	if (menu) {
 		[NSMenu popUpContextMenu:menu withEvent:event forView:self];
 	}
+}
+- (void)otherMouseDown:(NSEvent *)event {
+	if (event.buttonNumber == 2 && self.document) {
+		[self.owner forceCloseTab:self.document fromView:self];
+		return;
+	}
+	[super otherMouseDown:event];
 }
 - (void)mouseDown:(NSEvent *)event {
 	NSPoint start = event.locationInWindow;
@@ -82,9 +105,12 @@ static NSString *const NppTabDragType = @"npp.document.tab";
 }
 - (void)draggingSession:(NSDraggingSession *)session endedAtPoint:(NSPoint)screenPoint operation:(NSDragOperation)operation {
 	(void)session;
-	(void)screenPoint;
-	(void)operation;
+	DocumentTab *document = self.document;
+	BOOL outside = self.window && !NSPointInRect(screenPoint, self.window.frame);
 	[self.owner noteTabDragEnded];
+	if (outside && operation == NSDragOperationNone && document) {
+		[self.owner moveDocumentToNewWindow:document];
+	}
 }
 @end
 
@@ -93,11 +119,421 @@ static NSString *const NppTabDragType = @"npp.document.tab";
 @end
 
 @implementation NppTabCloseButton
+- (void)otherMouseDown:(NSEvent *)event {
+	DocumentTab *document = self.document;
+	if (event.buttonNumber == 2 && document && [self.target respondsToSelector:@selector(forceCloseTab:fromView:)]) {
+		[(id)self.target forceCloseTab:document fromView:self];
+		return;
+	}
+	[super otherMouseDown:event];
+}
 @end
 
 @interface NppTabChip : NSView
 @property (nonatomic, weak) DocumentTab *document;
 @end
+
+@interface NppTabLabel : NSView
+@property (nonatomic, copy) NSString *text;
+@property (nonatomic, strong) NSFont *font;
+@property (nonatomic, strong) NSColor *textColor;
+@end
+
+@interface NppTabBadge : NSView
+@property (nonatomic, copy) NSString *mark;
+@property (nonatomic, strong) NSColor *fill;
+@property (nonatomic, assign) BOOL darkText;
+@end
+
+@implementation NppTabBadge
+- (NSView *)hitTest:(NSPoint)point {
+	(void)point;
+	return nil;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+	(void)dirtyRect;
+	NSRect box = NSInsetRect(self.bounds, 0.5, 1);
+	NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:box xRadius:3 yRadius:3];
+	[(self.fill ?: NSColor.systemGrayColor) setFill];
+	[path fill];
+	if (self.mark.length == 0) {
+		return;
+	}
+	NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+	style.alignment = NSTextAlignmentCenter;
+	CGFloat size = self.mark.length >= 3 ? 6 : (self.mark.length == 2 ? 7 : 9);
+	NSDictionary *attributes = @{
+		NSFontAttributeName: [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightBold],
+		NSForegroundColorAttributeName: self.darkText ? NSColor.blackColor : NSColor.whiteColor,
+		NSParagraphStyleAttributeName: style
+	};
+	[self.mark drawWithRect:NSMakeRect(0, 3, NSWidth(self.bounds), NSHeight(self.bounds) - 3) options:NSStringDrawingUsesLineFragmentOrigin attributes:attributes];
+}
+@end
+
+@implementation NppTabLabel
+- (NSView *)hitTest:(NSPoint)point {
+	(void)point;
+	return nil;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+	(void)dirtyRect;
+	if (self.text.length == 0) {
+		return;
+	}
+	NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+	style.lineBreakMode = NSLineBreakByClipping;
+	style.alignment = NSTextAlignmentLeft;
+	NSDictionary *attributes = @{
+		NSFontAttributeName: self.font ?: [NSFont systemFontOfSize:12],
+		NSForegroundColorAttributeName: self.textColor ?: NSColor.labelColor,
+		NSParagraphStyleAttributeName: style
+	};
+	NSRect textRect = NSMakeRect(0, 1, self.bounds.size.width, self.bounds.size.height - 2);
+	[self.text drawWithRect:textRect options:NSStringDrawingUsesLineFragmentOrigin attributes:attributes];
+}
+@end
+
+static NSString *NppFitTitle(NSString *text, NSFont *font, CGFloat maxWidth) {
+	if (text.length == 0) {
+		return @"";
+	}
+	NSDictionary *attributes = @{NSFontAttributeName: font ?: [NSFont systemFontOfSize:12]};
+	if (maxWidth < 12 || [text sizeWithAttributes:attributes].width <= maxWidth) {
+		return text;
+	}
+	NSString *ellipsis = @"…";
+	NSString *best = ellipsis;
+	NSInteger low = 2;
+	NSInteger high = (NSInteger)text.length - 1;
+	while (low <= high) {
+		NSInteger mid = (low + high) / 2;
+		NSInteger head = MAX(1, mid / 2);
+		NSInteger tail = MAX(1, mid - head);
+		if (head + tail >= (NSInteger)text.length) {
+			high = mid - 1;
+			continue;
+		}
+		NSString *candidate = [NSString stringWithFormat:@"%@%@%@", [text substringToIndex:(NSUInteger)head], ellipsis, [text substringFromIndex:text.length - (NSUInteger)tail]];
+		if ([candidate sizeWithAttributes:attributes].width <= maxWidth) {
+			best = candidate;
+			low = mid + 1;
+		} else {
+			high = mid - 1;
+		}
+	}
+	return best;
+}
+
+static BOOL NppKnownFileBadge(NSString *key, NSString **mark, NSString **kind, NSColor **fill, BOOL *darkText) {
+	static NSDictionary<NSString *, NSArray *> *badges;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSColor *(^rgb)(int, int, int) = ^NSColor *(int red, int green, int blue) {
+			return [NSColor colorWithSRGBRed:red / 255.0 green:green / 255.0 blue:blue / 255.0 alpha:1];
+		};
+		badges = @{
+			@"html": @[@"<>", @"HTML", rgb(227, 76, 38), @NO],
+			@"htm": @[@"<>", @"HTML", rgb(227, 76, 38), @NO],
+			@"xml": @[@"<>", @"XML", rgb(240, 125, 40), @NO],
+			@"svg": @[@"SV", @"SVG", rgb(255, 181, 38), @YES],
+			@"json": @[@"{}", @"JSON", rgb(201, 162, 39), @YES],
+			@"json5": @[@"{}", @"JSON", rgb(201, 162, 39), @YES],
+			@"jsonc": @[@"{}", @"JSON", rgb(201, 162, 39), @YES],
+			@"yml": @[@"YL", @"YAML", rgb(139, 92, 246), @NO],
+			@"yaml": @[@"YL", @"YAML", rgb(139, 92, 246), @NO],
+			@"properties": @[@"PR", @"Properties", rgb(100, 116, 139), @NO],
+			@"props": @[@"PR", @"Properties", rgb(100, 116, 139), @NO],
+			@"ini": @[@"CF", @"Config", rgb(100, 116, 139), @NO],
+			@"conf": @[@"CF", @"Config", rgb(100, 116, 139), @NO],
+			@"cfg": @[@"CF", @"Config", rgb(100, 116, 139), @NO],
+			@"env": @[@"CF", @"Config", rgb(100, 116, 139), @NO],
+			@"toml": @[@"TM", @"TOML", rgb(156, 110, 72), @NO],
+			@"js": @[@"JS", @"JavaScript", rgb(201, 162, 39), @YES],
+			@"mjs": @[@"JS", @"JavaScript", rgb(201, 162, 39), @YES],
+			@"cjs": @[@"JS", @"JavaScript", rgb(201, 162, 39), @YES],
+			@"jsx": @[@"JS", @"JavaScript", rgb(201, 162, 39), @YES],
+			@"ts": @[@"TS", @"TypeScript", rgb(49, 120, 198), @NO],
+			@"tsx": @[@"TS", @"TypeScript", rgb(49, 120, 198), @NO],
+			@"css": @[@"CS", @"CSS", rgb(21, 114, 182), @NO],
+			@"scss": @[@"CS", @"CSS", rgb(205, 103, 153), @NO],
+			@"less": @[@"CS", @"CSS", rgb(29, 54, 93), @NO],
+			@"py": @[@"PY", @"Python", rgb(55, 118, 171), @NO],
+			@"md": @[@"MD", @"Markdown", rgb(90, 106, 122), @NO],
+			@"markdown": @[@"MD", @"Markdown", rgb(90, 106, 122), @NO],
+			@"sh": @[@"SH", @"Shell", rgb(78, 154, 81), @NO],
+			@"bash": @[@"SH", @"Shell", rgb(78, 154, 81), @NO],
+			@"zsh": @[@"SH", @"Shell", rgb(78, 154, 81), @NO],
+			@"sql": @[@"SQ", @"SQL", rgb(51, 103, 145), @NO],
+			@"php": @[@"PH", @"PHP", rgb(119, 123, 180), @NO],
+			@"java": @[@"JV", @"Java", rgb(176, 114, 25), @NO],
+			@"go": @[@"GO", @"Go", rgb(0, 173, 216), @YES],
+			@"rs": @[@"RS", @"Rust", rgb(206, 65, 43), @NO],
+			@"c": @[@"C", @"C", rgb(85, 85, 85), @NO],
+			@"cc": @[@"C+", @"C++", rgb(0, 89, 156), @NO],
+			@"cpp": @[@"C+", @"C++", rgb(0, 89, 156), @NO],
+			@"cxx": @[@"C+", @"C++", rgb(0, 89, 156), @NO],
+			@"h": @[@"C+", @"C++", rgb(0, 89, 156), @NO],
+			@"hpp": @[@"C+", @"C++", rgb(0, 89, 156), @NO],
+			@"swift": @[@"SW", @"Swift", rgb(240, 81, 56), @NO],
+			@"rb": @[@"RB", @"Ruby", rgb(176, 42, 36), @NO],
+			@"kt": @[@"KT", @"Kotlin", rgb(127, 82, 255), @NO],
+			@"dart": @[@"DT", @"Dart", rgb(0, 180, 171), @YES],
+			@"lua": @[@"LU", @"Lua", rgb(0, 0, 128), @NO],
+			@"pl": @[@"PL", @"Perl", rgb(2, 152, 195), @NO],
+			@"vue": @[@"VU", @"Vue", rgb(65, 184, 131), @YES],
+			@"csv": @[@"CV", @"CSV", rgb(46, 125, 50), @NO],
+			@"pdf": @[@"PF", @"PDF", rgb(220, 50, 47), @NO],
+			@"doc": @[@"W", @"Word", rgb(43, 87, 154), @NO],
+			@"docx": @[@"W", @"Word", rgb(43, 87, 154), @NO],
+			@"xlsx": @[@"XL", @"Excel", rgb(33, 115, 70), @NO],
+			@"log": @[@"LG", @"Log", rgb(120, 120, 120), @NO],
+			@"txt": @[@"TX", @"Text", rgb(120, 120, 120), @NO],
+			@"dockerfile": @[@"DK", @"Docker", rgb(36, 150, 237), @NO],
+			@"makefile": @[@"MK", @"Makefile", rgb(108, 117, 125), @NO]
+		};
+	});
+	NSArray *badge = badges[key.lowercaseString ?: @""];
+	if (badge.count < 4) {
+		return NO;
+	}
+	if (mark) {
+		*mark = badge[0];
+	}
+	if (kind) {
+		*kind = badge[1];
+	}
+	if (fill) {
+		*fill = badge[2];
+	}
+	if (darkText) {
+		*darkText = [badge[3] boolValue];
+	}
+	return YES;
+}
+
+static NSImage *NppTintedSymbol(NSString *name, NSColor *color) {
+	NSImage *image = [NSImage imageWithSystemSymbolName:name accessibilityDescription:name];
+	if (!image) {
+		return nil;
+	}
+	NSImageSymbolConfiguration *size = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+	NSImageSymbolConfiguration *palette = [NSImageSymbolConfiguration configurationWithPaletteColors:@[color ?: NSColor.labelColor]];
+	image = [image imageWithSymbolConfiguration:[size configurationByApplyingConfiguration:palette]] ?: image;
+	image.size = NSMakeSize(16, 16);
+	return image;
+}
+
+static NSImage *NppFileMarkImage(NSString *key) {
+	static NSMutableDictionary<NSString *, NSImage *> *cache;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		cache = [NSMutableDictionary dictionary];
+	});
+	NSString *lookup = key.lowercaseString ?: @"";
+	NSImage *cached = cache[lookup];
+	if (cached) {
+		return cached == (id)[NSNull null] ? nil : cached;
+	}
+	NSString *mark = nil;
+	NSString *kind = nil;
+	NSColor *fill = nil;
+	BOOL darkText = NO;
+	if (!NppKnownFileBadge(lookup, &mark, &kind, &fill, &darkText)) {
+		cache[lookup] = (id)[NSNull null];
+		return nil;
+	}
+	NSImage *image = [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect rect) {
+		NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(rect, 0, 1) xRadius:3 yRadius:3];
+		[fill setFill];
+		[path fill];
+		NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+		style.alignment = NSTextAlignmentCenter;
+		CGFloat size = mark.length >= 3 ? 6 : (mark.length == 2 ? 7.5 : 9);
+		NSDictionary *attributes = @{
+			NSFontAttributeName: [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightBold],
+			NSForegroundColorAttributeName: darkText ? NSColor.blackColor : NSColor.whiteColor,
+			NSParagraphStyleAttributeName: style
+		};
+		[mark drawWithRect:NSMakeRect(0, 2.5, 16, 12) options:NSStringDrawingUsesLineFragmentOrigin attributes:attributes];
+		return YES;
+	}];
+	cache[lookup] = image;
+	return image;
+}
+
+static NSImage *NppSidebarFileIcon(NSString *name, NSString *path, BOOL directory) {
+	NSString *extension = name.pathExtension.lowercaseString ?: @"";
+	if (directory && ![extension isEqualToString:@"app"]) {
+		static NSImage *folder;
+		static dispatch_once_t once;
+		dispatch_once(&once, ^{
+			folder = NppTintedSymbol(@"folder.fill", NSColor.systemBlueColor);
+		});
+		return folder;
+	}
+	if ([extension isEqualToString:@"app"] || [extension isEqualToString:@"png"] || [extension isEqualToString:@"jpg"] || [extension isEqualToString:@"jpeg"] || [extension isEqualToString:@"gif"] || [extension isEqualToString:@"webp"] || [extension isEqualToString:@"icns"] || [extension isEqualToString:@"pdf"] || [extension isEqualToString:@"dmg"]) {
+		NSImage *icon = [[NSWorkspace sharedWorkspace] iconForFile:path];
+		icon.size = NSMakeSize(16, 16);
+		return icon;
+	}
+	NSImage *badge = NppFileMarkImage(extension);
+	if (!badge && name.length) {
+		badge = NppFileMarkImage(name.lowercaseString);
+	}
+	if (badge) {
+		return badge;
+	}
+	if ([@[@"zip", @"gz", @"tgz", @"tar", @"7z", @"rar"] containsObject:extension]) {
+		static NSImage *archive;
+		static dispatch_once_t once;
+		dispatch_once(&once, ^{
+			archive = NppTintedSymbol(@"doc.zipper", NSColor.systemBrownColor);
+		});
+		return archive;
+	}
+	static NSImage *plain;
+	static dispatch_once_t plainOnce;
+	dispatch_once(&plainOnce, ^{
+		plain = NppTintedSymbol(@"doc", NSColor.secondaryLabelColor);
+	});
+	return plain;
+}
+
+static NSView *NppFileBadge(DocumentTab *document, NSString **kind) {
+	NSString *extension = document.displayName.pathExtension.lowercaseString;
+	if (extension.length == 0) {
+		extension = document.path.pathExtension.lowercaseString;
+	}
+	NSString *base = document.displayName.stringByDeletingPathExtension.lowercaseString ?: @"";
+	NSDictionary *aliases = @{
+		@"hypertext": @"html",
+		@"html": @"html",
+		@"javascript.js": @"js",
+		@"javascript": @"js",
+		@"yaml": @"yml",
+		@"props": @"properties",
+		@"markdown": @"md",
+		@"python": @"py",
+		@"bash": @"sh",
+		@"json5": @"json",
+		@"phpscript": @"php",
+		@"cpp": @"cpp"
+	};
+	NSMutableArray<NSString *> *keys = [NSMutableArray array];
+	for (NSString *raw in @[extension ?: @"", base, document.language.lowercaseString ?: @"", document.lexerName.lowercaseString ?: @""]) {
+		if (raw.length == 0) {
+			continue;
+		}
+		[keys addObject:aliases[raw] ?: raw];
+		[keys addObject:raw];
+	}
+	if ([base isEqualToString:@"dockerfile"] || [document.displayName.lowercaseString hasPrefix:@"dockerfile"]) {
+		[keys insertObject:@"dockerfile" atIndex:0];
+	}
+	if ([base isEqualToString:@"makefile"] || [document.displayName.lowercaseString hasPrefix:@"makefile"]) {
+		[keys insertObject:@"makefile" atIndex:0];
+	}
+	for (NSString *key in keys) {
+		NSString *mark = nil;
+		NSString *name = nil;
+		NSColor *fill = nil;
+		BOOL darkText = NO;
+		if (!NppKnownFileBadge(key, &mark, &name, &fill, &darkText)) {
+			continue;
+		}
+		if (kind) {
+			*kind = name;
+		}
+		NppTabBadge *badge = [NppTabBadge new];
+		badge.mark = mark;
+		badge.fill = fill;
+		badge.darkText = darkText;
+		return badge;
+	}
+	if (kind) {
+		*kind = nil;
+	}
+	NSImage *image = [NSImage imageWithSystemSymbolName:@"doc.text" accessibilityDescription:@"Text"];
+	NSImageView *icon = [NSImageView imageViewWithImage:image];
+	icon.imageScaling = NSImageScaleProportionallyDown;
+	icon.contentTintColor = NSColor.secondaryLabelColor;
+	icon.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:12 weight:NSFontWeightRegular];
+	return icon;
+}
+
+static NSString *NppZoomLine(ScintillaView *editor, long line) {
+	long start = [editor message:SCI_POSITIONFROMLINE wParam:(uptr_t)line lParam:0];
+	long end = [editor message:SCI_GETLINEENDPOSITION wParam:(uptr_t)line lParam:0];
+	if (end < start) {
+		return @"";
+	}
+	long length = MIN(240, end - start);
+	if (length <= 0) {
+		return @"";
+	}
+	std::string buffer(static_cast<size_t>(length) + 1, '\0');
+	Sci_TextRangeFull range;
+	range.chrg.cpMin = start;
+	range.chrg.cpMax = start + length;
+	range.lpstrText = buffer.data();
+	[editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	NSString *text = nil;
+	NSUInteger count = (NSUInteger)length;
+	while (count > 0 && !text) {
+		text = [[NSString alloc] initWithBytes:buffer.data() length:count encoding:NSUTF8StringEncoding];
+		if (!text) {
+			count--;
+		}
+	}
+	text = [text ?: @"" stringByReplacingOccurrencesOfString:@"\t" withString:@"    "];
+	if (end - start > length) {
+		text = [text stringByAppendingString:@"…"];
+	}
+	return text;
+}
+
+static long NppZoomColumnPosition(ScintillaView *editor, long line, long visualColumn) {
+	long start = [editor message:SCI_POSITIONFROMLINE wParam:(uptr_t)line lParam:0];
+	long end = [editor message:SCI_GETLINEENDPOSITION wParam:(uptr_t)line lParam:0];
+	if (visualColumn <= 0 || end <= start) {
+		return start;
+	}
+	long length = MIN(end - start, 4000);
+	std::string buffer(static_cast<size_t>(length) + 1, '\0');
+	Sci_TextRangeFull range;
+	range.chrg.cpMin = start;
+	range.chrg.cpMax = start + length;
+	range.lpstrText = buffer.data();
+	[editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	NSString *text = nil;
+	NSUInteger count = (NSUInteger)length;
+	while (count > 0 && !text) {
+		text = [[NSString alloc] initWithBytes:buffer.data() length:count encoding:NSUTF8StringEncoding];
+		if (!text) {
+			count--;
+		}
+	}
+	if (text.length == 0) {
+		return start;
+	}
+	__block NSUInteger used = 0;
+	__block long visual = 0;
+	[text enumerateSubstringsInRange:NSMakeRange(0, text.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *character, NSRange range, NSRange enclosing, BOOL *stop) {
+		(void)enclosing;
+		if (visual >= visualColumn) {
+			*stop = YES;
+			return;
+		}
+		visual += [character isEqualToString:@"\t"] ? 4 : 1;
+		used = NSMaxRange(range);
+	}];
+	NSUInteger bytes = [[text substringToIndex:used] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+	long pos = start + (long)bytes;
+	return MIN(end, MAX(start, pos));
+}
 
 @implementation NppTabChip
 @end
@@ -132,6 +568,14 @@ static NSURL *SupportDirectory(void) {
 - (BOOL)openDroppedPaths:(NSArray<NSString *> *)paths;
 @end
 
+@interface AppDelegate (FolderLayout)
+- (void)layoutFolderSidebar;
+@end
+
+@interface AppDelegate (Appearance)
+- (void)systemAppearanceChanged;
+@end
+
 @interface NppDropOverlay : NSView
 @end
 
@@ -152,6 +596,27 @@ static NSURL *SupportDirectory(void) {
 		[self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 	}
 	return self;
+}
+- (void)viewDidChangeEffectiveAppearance {
+	[super viewDidChangeEffectiveAppearance];
+	[self.dropOwner systemAppearanceChanged];
+}
+- (NSView *)hitTest:(NSPoint)point {
+	NSView *hit = [super hitTest:point];
+	NSPoint local = [self convertPoint:point fromView:self.superview];
+	for (NSView *view in self.subviews) {
+		if (view.hidden || ![view.identifier isEqualToString:@"npp.minimapZoom"]) {
+			continue;
+		}
+		if (!NSPointInRect(local, view.frame)) {
+			continue;
+		}
+		NSView *cardHit = [view hitTest:local];
+		if (cardHit) {
+			return cardHit;
+		}
+	}
+	return hit;
 }
 - (NSArray<NSString *> *)droppedFilePaths:(id<NSDraggingInfo>)sender {
 	NSArray<NSURL *> *urls = [sender.draggingPasteboard readObjectsForClasses:@[[NSURL class]] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
@@ -235,7 +700,7 @@ static NSURL *SupportDirectory(void) {
 	_layingOut = YES;
 	NSRect bounds = self.bounds;
 	CGFloat menuHeight = 26;
-	CGFloat toolbarHeight = 42;
+	CGFloat toolbarHeight = 72;
 	CGFloat tabHeight = self.tabStrip.hidden ? 0 : 30;
 	CGFloat statusHeight = 24;
 	CGFloat compareHeight = self.compareVisible ? 32 : 0;
@@ -249,16 +714,27 @@ static NSURL *SupportDirectory(void) {
 	self.compareBar.frame = NSMakeRect(0, statusHeight, bounds.size.width, compareHeight);
 	self.compareBar.hidden = !self.compareVisible;
 	if (self.compareVisible) {
-		CGFloat barWidth = self.compareBar.bounds.size.width;
+		CGFloat x = self.compareBar.bounds.size.width - 8;
+		for (NSNumber *tag in @[@44, @43, @42, @46, @45]) {
+			NSButton *button = nil;
+			for (NSView *view in self.compareBar.subviews) {
+				if (view.tag == tag.integerValue && [view isKindOfClass:[NSButton class]]) {
+					button = (NSButton *)view;
+					break;
+				}
+			}
+			if (!button) {
+				continue;
+			}
+			[button sizeToFit];
+			CGFloat width = ceil(NSWidth(button.bounds)) + 14;
+			x -= width;
+			button.frame = NSMakeRect(x, 4, width, 24);
+			x -= 6;
+		}
 		for (NSView *view in self.compareBar.subviews) {
 			if (view.tag == 41) {
-				view.frame = NSMakeRect(12, 6, MAX(160, barWidth - 300), 20);
-			} else if (view.tag == 42) {
-				view.frame = NSMakeRect(barWidth - 252, 4, 84, 24);
-			} else if (view.tag == 43) {
-				view.frame = NSMakeRect(barWidth - 162, 4, 64, 24);
-			} else if (view.tag == 44) {
-				view.frame = NSMakeRect(barWidth - 92, 4, 80, 24);
+				view.frame = NSMakeRect(12, 6, MAX(40, x - 18), 20);
 			}
 		}
 	}
@@ -272,21 +748,7 @@ static NSURL *SupportDirectory(void) {
 	self.sidebar.frame = NSMakeRect(0, bottom, side, editorHeight);
 	self.sidebar.hidden = !self.sidebarVisible;
 	if (self.sidebarVisible) {
-		CGFloat sideHeight = self.sidebar.bounds.size.height;
-		CGFloat sideWidth = self.sidebar.bounds.size.width;
-		for (NSView *view in self.sidebar.subviews) {
-			if (view.tag == 1) {
-				view.frame = NSMakeRect(10, sideHeight - 24, MAX(40, sideWidth - 128), 18);
-			} else if (view.tag == 3) {
-				view.frame = NSMakeRect(sideWidth - 112, sideHeight - 26, 36, 22);
-			} else if (view.tag == 4) {
-				view.frame = NSMakeRect(sideWidth - 72, sideHeight - 26, 62, 22);
-			} else if (view.tag == 2) {
-				view.frame = NSMakeRect(8, sideHeight - 54, MAX(40, sideWidth - 16), 24);
-			} else if ([view isKindOfClass:[NSScrollView class]]) {
-				view.frame = NSMakeRect(0, 0, sideWidth, MAX(0, sideHeight - 62));
-			}
-		}
+		[self.dropOwner layoutFolderSidebar];
 	}
 	NSRect editorFrame = NSMakeRect(side, bottom, MAX(0, bounds.size.width - side), editorHeight);
 	self.tabs.frame = editorFrame;
@@ -305,6 +767,12 @@ static NSURL *SupportDirectory(void) {
 		_dropOverlay.frame = bounds;
 		[self addSubview:_dropOverlay positioned:NSWindowAbove relativeTo:nil];
 	}
+	for (NSView *view in self.subviews) {
+		if ([view.identifier isEqualToString:@"npp.minimapZoom"] && !view.hidden) {
+			[self addSubview:view positioned:NSWindowAbove relativeTo:nil];
+			break;
+		}
+	}
 	_layingOut = NO;
 }
 @end
@@ -320,14 +788,21 @@ static const int kCompareMarker = 25;
 - (void)splitHostDidFinishResize;
 @end
 
+@interface NppSplitPreview : NSView
+@property (nonatomic, copy) NSString *label;
+@end
+
 @interface NppPaneSlot : NSView
 @property (nonatomic, assign) NSInteger paneIndex;
 @property (nonatomic, copy) NSString *title;
 @property (nonatomic, assign) BOOL activePane;
 @property (nonatomic, strong) NppPaneTabBar *tabBar;
+@property (nonatomic, assign) NSInteger splitDropSide;
 - (NSRect)editorRect;
 - (void)layoutContents;
 - (void)removeEditorViews;
+- (void)showSplitPreview:(NSInteger)side;
+- (void)clearSplitPreview;
 @end
 
 @interface NppSplitHost : NSView
@@ -345,6 +820,39 @@ static const int kCompareMarker = 25;
 @property (nonatomic, weak) AppDelegate *owner;
 @property (nonatomic, assign) NSInteger paneIndex;
 @property (nonatomic, assign) NSInteger dropIndex;
+@property (nonatomic, assign) CGFloat scrollOffset;
+@property (nonatomic, assign) CGFloat contentWidth;
+@property (nonatomic, weak) DocumentTab *anchoredDocument;
+- (void)noteContentWidth:(CGFloat)width;
+- (void)revealDocument:(DocumentTab *)document;
+@end
+
+@implementation NppSplitPreview
+- (instancetype)initWithFrame:(NSRect)frameRect {
+	self = [super initWithFrame:frameRect];
+	if (self) {
+		self.wantsLayer = YES;
+		self.layer.backgroundColor = [NSColor.controlAccentColor colorWithAlphaComponent:0.20].CGColor;
+		self.layer.borderWidth = 2;
+		self.layer.borderColor = NSColor.controlAccentColor.CGColor;
+	}
+	return self;
+}
+- (NSView *)hitTest:(NSPoint)point {
+	(void)point;
+	return nil;
+}
+- (void)drawRect:(NSRect)dirtyRect {
+	(void)dirtyRect;
+	NSString *text = self.label ?: @"";
+	NSDictionary *attributes = @{
+		NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
+		NSForegroundColorAttributeName: NSColor.labelColor
+	};
+	NSSize size = [text sizeWithAttributes:attributes];
+	NSRect textRect = NSMakeRect(NSMidX(self.bounds) - size.width / 2, NSMidY(self.bounds) - size.height / 2, size.width, size.height);
+	[text drawInRect:textRect withAttributes:attributes];
+}
 @end
 
 @implementation NppPaneTabBar
@@ -389,14 +897,49 @@ static const int kCompareMarker = 25;
 	[NSColor.controlAccentColor setFill];
 	NSRectFill(NSMakeRect(x, 4, 2, MAX(8, self.bounds.size.height - 8)));
 }
+- (NppPaneSlot *)paneSlot {
+	return [self.superview isKindOfClass:[NppPaneSlot class]] ? (NppPaneSlot *)self.superview : nil;
+}
+- (BOOL)offerSplitForDocument:(DocumentTab *)document atPoint:(NSPoint)point {
+	CGFloat chipsMin = CGFLOAT_MAX;
+	CGFloat chipsMax = -1;
+	BOOL overChip = NO;
+	for (NSView *view in self.subviews) {
+		if (![view isKindOfClass:[NppTabChip class]]) {
+			continue;
+		}
+		chipsMin = MIN(chipsMin, NSMinX(view.frame));
+		chipsMax = MAX(chipsMax, NSMaxX(view.frame));
+		if (NSPointInRect(point, NSInsetRect(view.frame, -2, 0))) {
+			overChip = YES;
+		}
+	}
+	BOOL besideChips = chipsMax >= 0 && !overChip && (point.x < chipsMin - 8 || point.x > chipsMax + 28);
+	if (!besideChips) {
+		return NO;
+	}
+	BOOL onRight = point.x > chipsMax;
+	if (![self.owner canSplitDocument:document besidePane:self.paneIndex onRight:onRight]) {
+		return NO;
+	}
+	self.dropIndex = -1;
+	[self.paneSlot showSplitPreview:onRight ? 1 : -1];
+	[self setNeedsDisplay:YES];
+	return YES;
+}
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
 	return [self draggingUpdated:sender];
 }
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
-	if (![self.owner draggedTabDocument]) {
+	DocumentTab *document = [self.owner draggedTabDocument];
+	if (!document) {
 		return NSDragOperationNone;
 	}
 	NSPoint point = [self convertPoint:sender.draggingLocation fromView:nil];
+	if ([self offerSplitForDocument:document atPoint:point]) {
+		return NSDragOperationMove;
+	}
+	[self.paneSlot clearSplitPreview];
 	self.dropIndex = [self insertionIndexAtPoint:point];
 	[self setNeedsDisplay:YES];
 	return NSDragOperationMove;
@@ -404,6 +947,7 @@ static const int kCompareMarker = 25;
 - (void)draggingExited:(id<NSDraggingInfo>)sender {
 	(void)sender;
 	self.dropIndex = -1;
+	[self.paneSlot clearSplitPreview];
 	[self setNeedsDisplay:YES];
 }
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
@@ -412,18 +956,96 @@ static const int kCompareMarker = 25;
 }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
 	DocumentTab *document = [self.owner draggedTabDocument];
+	NppPaneSlot *slot = self.paneSlot;
+	BOOL split = slot.splitDropSide != 0;
+	BOOL onRight = slot.splitDropSide > 0;
 	NSInteger index = self.dropIndex < 0 ? [self insertionIndexAtPoint:[self convertPoint:sender.draggingLocation fromView:nil]] : self.dropIndex;
 	self.dropIndex = -1;
+	[slot clearSplitPreview];
 	[self setNeedsDisplay:YES];
 	if (!document) {
 		return NO;
 	}
+	if (split) {
+		return [self.owner splitDocument:document besidePane:self.paneIndex onRight:onRight];
+	}
 	[self.owner moveDocument:document toPane:self.paneIndex atIndex:index];
 	return YES;
 }
+- (void)setScrollOffset:(CGFloat)offset {
+	CGFloat maxOffset = MAX(0, _contentWidth - NSWidth(self.bounds));
+	offset = MIN(MAX(0, offset), maxOffset);
+	CGFloat delta = _scrollOffset - offset;
+	_scrollOffset = offset;
+	if (fabs(delta) < 0.01) {
+		return;
+	}
+	for (NSView *view in self.subviews) {
+		if (![view isKindOfClass:[NppTabChip class]]) {
+			continue;
+		}
+		NSRect frame = view.frame;
+		frame.origin.x += delta;
+		view.frame = frame;
+	}
+	[self setNeedsDisplay:YES];
+}
+- (void)noteContentWidth:(CGFloat)width {
+	_contentWidth = width;
+	CGFloat saved = _scrollOffset;
+	_scrollOffset = 0;
+	[self setScrollOffset:saved];
+}
+- (void)revealDocument:(DocumentTab *)document {
+	if (!document) {
+		return;
+	}
+	NppTabChip *chip = nil;
+	for (NSView *view in self.subviews) {
+		if ([view isKindOfClass:[NppTabChip class]] && ((NppTabChip *)view).document == document) {
+			chip = (NppTabChip *)view;
+			break;
+		}
+	}
+	if (!chip) {
+		return;
+	}
+	CGFloat visible = NSWidth(self.bounds);
+	CGFloat left = NSMinX(chip.frame);
+	CGFloat right = NSMaxX(chip.frame);
+	CGFloat adjust = 0;
+	if (left < 4) {
+		adjust = left - 4;
+	} else if (right > visible - 4) {
+		adjust = right - (visible - 4);
+	}
+	if (fabs(adjust) >= 1) {
+		[self setScrollOffset:_scrollOffset + adjust];
+	}
+}
+- (void)setFrameSize:(NSSize)newSize {
+	[super setFrameSize:newSize];
+	[self setScrollOffset:_scrollOffset];
+}
+- (void)scrollWheel:(NSEvent *)event {
+	CGFloat delta = event.scrollingDeltaX;
+	if (fabs(delta) < fabs(event.scrollingDeltaY)) {
+		delta = event.scrollingDeltaY;
+	}
+	if (!event.hasPreciseScrollingDeltas) {
+		delta *= 16;
+	}
+	if (fabs(delta) < 0.01 || _contentWidth <= NSWidth(self.bounds) + 1) {
+		return;
+	}
+	[self setScrollOffset:_scrollOffset - delta];
+}
 @end
 
-@implementation NppPaneSlot
+@implementation NppPaneSlot {
+	NppSplitPreview *_splitPreview;
+	BOOL _updatingSplitPreview;
+}
 - (CGFloat)headerHeight {
 	return kPaneHeader;
 }
@@ -435,20 +1057,90 @@ static const int kCompareMarker = 25;
 	CGFloat header = self.headerHeight;
 	self.tabBar.frame = NSMakeRect(0, NSHeight(self.bounds) - header + 2, NSWidth(self.bounds), MAX(0, header - 2));
 	NSRect editorRect = self.editorRect;
+	NSView *minimap = nil;
+	NSView *preview = nil;
+	NSView *csvBar = nil;
+	NSMutableArray<NSView *> *editors = [NSMutableArray array];
 	for (NSView *subview in self.subviews) {
-		if (subview == self.tabBar) {
+		if (subview == self.tabBar || subview == _splitPreview) {
 			continue;
 		}
-		subview.frame = editorRect;
+		if ([subview.identifier isEqualToString:@"npp.minimap"]) {
+			minimap = subview;
+		} else if ([subview.identifier isEqualToString:@"npp.preview"]) {
+			preview = subview;
+		} else if ([subview.identifier isEqualToString:@"npp.minimapZoom"]) {
+			continue;
+		} else if ([subview.identifier isEqualToString:@"npp.csv.bar"]) {
+			csvBar = subview;
+		} else {
+			[editors addObject:subview];
+		}
+	}
+	CGFloat mini = (minimap && !minimap.hidden) ? 64 : 0;
+	CGFloat previewWidth = (preview && !preview.hidden) ? floor(editorRect.size.width * 0.42) : 0;
+	CGFloat editorsWidth = MAX(1, editorRect.size.width - mini - previewWidth);
+	CGFloat csvBarHeight = csvBar ? 32 : 0;
+	for (NSView *editor in editors) {
+		editor.frame = NSMakeRect(editorRect.origin.x, editorRect.origin.y, editorsWidth, MAX(1, editorRect.size.height - csvBarHeight));
+	}
+	if (csvBar) {
+		csvBar.frame = NSMakeRect(editorRect.origin.x, NSMaxY(editorRect) - csvBarHeight, editorsWidth, csvBarHeight);
+		NSButton *button = [csvBar viewWithTag:1];
+		button.title = NppL(@"As Table");
+		[button sizeToFit];
+		button.frame = NSMakeRect(8, 4, MAX(108, ceil(NSWidth(button.frame)) + 16), 24);
+		NSTextField *hint = [csvBar viewWithTag:2];
+		hint.stringValue = NppL(@"This CSV is open as text.");
+		hint.frame = NSMakeRect(NSMaxX(button.frame) + 8, 7, MAX(40, NSWidth(csvBar.bounds) - NSMaxX(button.frame) - 16), 18);
+	}
+	if (preview && !preview.hidden) {
+		preview.frame = NSMakeRect(editorRect.origin.x + editorsWidth, editorRect.origin.y, previewWidth, editorRect.size.height);
+	}
+	if (minimap && !minimap.hidden) {
+		minimap.frame = NSMakeRect(NSMaxX(editorRect) - mini, editorRect.origin.y, mini, editorRect.size.height);
+	}
+	if (self.splitDropSide != 0 && !_updatingSplitPreview) {
+		_updatingSplitPreview = YES;
+		[self showSplitPreview:self.splitDropSide];
+		_updatingSplitPreview = NO;
 	}
 }
 - (void)removeEditorViews {
 	for (NSView *subview in self.subviews.copy) {
-		if (subview == self.tabBar) {
+		if (subview == self.tabBar || subview == _splitPreview || [subview.identifier isEqualToString:@"npp.minimap"] || [subview.identifier isEqualToString:@"npp.minimapZoom"] || [subview.identifier isEqualToString:@"npp.preview"]) {
 			continue;
 		}
 		[subview removeFromSuperview];
 	}
+}
+- (void)clearSplitPreview {
+	self.splitDropSide = 0;
+	[_splitPreview removeFromSuperview];
+}
+- (void)showSplitPreview:(NSInteger)side {
+	if (side == 0) {
+		[self clearSplitPreview];
+		return;
+	}
+	self.splitDropSide = side;
+	if (!_splitPreview) {
+		_splitPreview = [[NppSplitPreview alloc] initWithFrame:NSZeroRect];
+	}
+	NSRect editor = self.editorRect;
+	CGFloat width = MAX(80, floor(editor.size.width * 0.5));
+	if (side < 0) {
+		_splitPreview.frame = NSMakeRect(editor.origin.x, editor.origin.y, MIN(width, editor.size.width), editor.size.height);
+		_splitPreview.label = @"Split left";
+	} else {
+		CGFloat previewWidth = MIN(width, editor.size.width);
+		_splitPreview.frame = NSMakeRect(NSMaxX(editor) - previewWidth, editor.origin.y, previewWidth, editor.size.height);
+		_splitPreview.label = @"Split right";
+	}
+	if (_splitPreview.superview != self) {
+		[self addSubview:_splitPreview positioned:NSWindowBelow relativeTo:self.tabBar];
+	}
+	[_splitPreview setNeedsDisplay:YES];
 }
 - (void)setFrameSize:(NSSize)newSize {
 	[super setFrameSize:newSize];
@@ -490,10 +1182,27 @@ static const int kCompareMarker = 25;
 	return [self draggingUpdated:sender];
 }
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
-	if (![self.tabBar.owner draggedTabDocument]) {
+	DocumentTab *document = [self.tabBar.owner draggedTabDocument];
+	if (!document) {
+		[self clearSplitPreview];
 		return NSDragOperationNone;
 	}
-	self.tabBar.dropIndex = (NSInteger)self.tabBar.subviews.count;
+	NSPoint point = [self convertPoint:sender.draggingLocation fromView:nil];
+	NSRect editor = self.editorRect;
+	if (editor.size.width > 1 && point.y <= NSMaxY(editor)) {
+		CGFloat rel = (point.x - editor.origin.x) / editor.size.width;
+		if (rel <= 0.45 || rel >= 0.55) {
+			BOOL onRight = rel >= 0.55;
+			if ([self.tabBar.owner canSplitDocument:document besidePane:self.paneIndex onRight:onRight]) {
+				self.tabBar.dropIndex = -1;
+				[self.tabBar setNeedsDisplay:YES];
+				[self showSplitPreview:onRight ? 1 : -1];
+				(void)sender;
+				return NSDragOperationMove;
+			}
+		}
+	}
+	[self clearSplitPreview];
 	NSInteger chips = 0;
 	for (NSView *view in self.tabBar.subviews) {
 		if ([view isKindOfClass:[NppTabChip class]]) {
@@ -508,6 +1217,7 @@ static const int kCompareMarker = 25;
 - (void)draggingExited:(id<NSDraggingInfo>)sender {
 	(void)sender;
 	self.tabBar.dropIndex = -1;
+	[self clearSplitPreview];
 	[self.tabBar setNeedsDisplay:YES];
 }
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender {
@@ -517,10 +1227,16 @@ static const int kCompareMarker = 25;
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
 	(void)sender;
 	DocumentTab *document = [self.tabBar.owner draggedTabDocument];
+	BOOL split = self.splitDropSide != 0;
+	BOOL onRight = self.splitDropSide > 0;
 	NSInteger index = self.tabBar.dropIndex < 0 ? 0 : self.tabBar.dropIndex;
 	self.tabBar.dropIndex = -1;
+	[self clearSplitPreview];
 	if (!document) {
 		return NO;
+	}
+	if (split) {
+		return [self.tabBar.owner splitDocument:document besidePane:self.paneIndex onRight:onRight];
 	}
 	[self.tabBar.owner moveDocument:document toPane:self.paneIndex atIndex:index];
 	return YES;
@@ -831,11 +1547,24 @@ static NSArray<NSDictionary *> *NppDiffLines(NSArray<NSString *> *left, NSArray<
 @property (nonatomic, copy) NSString *path;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, assign) BOOL directory;
+@property (nonatomic, strong) NSImage *icon;
 @property (nonatomic, strong) NSMutableArray<NppFolderNode *> *children;
 @property (nonatomic, assign) BOOL loaded;
 @end
 
 @implementation NppFolderNode
+@end
+
+@interface NppFolderCell : NSTableCellView
+@end
+
+@implementation NppFolderCell
+- (void)layout {
+	[super layout];
+	CGFloat height = NSHeight(self.bounds);
+	self.imageView.frame = NSMakeRect(2, floor((height - 16) / 2.0), 16, 16);
+	self.textField.frame = NSMakeRect(22, 0, MAX(0, NSWidth(self.bounds) - 28), height);
+}
 @end
 
 @implementation AppDelegate {
@@ -863,14 +1592,24 @@ static NSArray<NSDictionary *> *NppDiffLines(NSArray<NSString *> *left, NSArray<
 	NSButton *_filesWord;
 	NSButton *_filesRegex;
 	NSButton *_filesSubfolders;
+	NSProgressIndicator *_findProgress;
+	NSTextField *_findProgressLabel;
+	NSButton *_findCancel;
+	NppFindScanToken *_findToken;
 	NSTextField *_status;
 	NSButton *_tailButton;
 	NSView *_sidebar;
 	NSOutlineView *_folderOutline;
 	NSString *_folderRoot;
 	NppFolderNode *_folderRootNode;
+	NSSearchField *_folderFindField;
+	NSString *_folderQuery;
+	NSArray<NppFolderNode *> *_folderMatches;
+	NSInteger _folderSearchGeneration;
 	NSTextView *_preferencesShortcuts;
 	NSWindow *_preferencesWindow;
+	BOOL _captureShortcut;
+	NSWindow *_characterPanel;
 	NSWindow *_quickOpenPanel;
 	NSSearchField *_quickOpenField;
 	NSTableView *_quickOpenTable;
@@ -895,6 +1634,7 @@ static NSArray<NSDictionary *> *NppDiffLines(NSArray<NSString *> *left, NSArray<
 	EditorSettings *_settings;
 	MacroStore *_macro;
 	NSMutableArray<DocumentTab *> *_documents;
+	NSMapTable<DocumentTab *, NppOfficeRef *> *_office;
 	NSMutableArray<NSString *> *_pendingOpenPaths;
 	NSInteger _untitled;
 	NSTimer *_recoveryTimer;
@@ -906,6 +1646,31 @@ static NSArray<NSDictionary *> *NppDiffLines(NSArray<NSString *> *left, NSArray<
 	NSMutableArray<NSDictionary *> *_plugins;
 	NSMutableArray<NSString *> *_pluginErrors;
 	NSString *_statusOverride;
+	NSTableView *_outlineTable;
+	NSArray<NppSymbol *> *_outlineRows;
+	NSInteger _sidebarPage;
+	WKWebView *_preview;
+	BOOL _previewVisible;
+	NppSnippetStore *_snippets;
+	NppClipboardHistory *_clips;
+	NppUserLanguageStore *_userLanguages;
+	DocumentTab *_cloneSource;
+	NSInteger _clonePane;
+	NSMutableArray<NSMutableDictionary *> *_shortcutRows;
+	NSTableView *_shortcutTable;
+	NSWindow *_clipboardWindow;
+	NSTableView *_clipboardTable;
+	NSWindow *_snippetWindow;
+	NSTableView *_snippetTable;
+	NSWindow *_languageWindow;
+	NSTableView *_languageTable;
+	BOOL _suppressEmptyDocument;
+	NSPanel *_zoomPanel;
+	NppMinimapZoom *_zoomCard;
+	__weak NppMinimapView *_zoomMap;
+	id _zoomClickMonitor;
+	NSInteger _zoomHideGeneration;
+	CGFloat _cmdZoomAccum;
 }
 
 static AppDelegate *HostApp(NppMacHost *host) {
@@ -982,10 +1747,16 @@ static void HostStatus(NppMacHost *host, const char *text) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
 	(void)notification;
 	_documents = [NSMutableArray array];
+	_office = [NSMapTable weakToStrongObjectsMapTable];
+	_clonePane = NSNotFound;
+	_snippets = [NppSnippetStore loadFromURL:[SupportDirectory() URLByAppendingPathComponent:@"snippets.json"]];
+	_clips = [NppClipboardHistory new];
+	_userLanguages = [NppUserLanguageStore loadFromURL:[SupportDirectory() URLByAppendingPathComponent:@"languages.json"]];
 	_plugins = [NSMutableArray array];
 	_pluginErrors = [NSMutableArray array];
 	_macro = [MacroStore new];
 	_settings = [EditorSettings loadFromURL:[SupportDirectory() URLByAppendingPathComponent:@"settings.json"]];
+	NppSetUILanguage(_settings.uiLanguage);
 	NSError *error = nil;
 	[_macro loadFromURL:[SupportDirectory() URLByAppendingPathComponent:@"macro.json"] error:&error];
 	NSString *langs = [NSBundle.mainBundle pathForResource:@"langs.model" ofType:@"xml"];
@@ -1029,6 +1800,12 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_fileWatchTimer = [NSTimer scheduledTimerWithTimeInterval:2 target:self selector:@selector(checkExternalChanges) userInfo:nil repeats:YES];
 	[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *event) {
 		return [self handleEditorHotkey:event];
+	}];
+	[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel handler:^NSEvent *(NSEvent *event) {
+		return [self handleCommandZoom:event];
+	}];
+	[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown handler:^NSEvent *(NSEvent *event) {
+		return [self handleExtraCaretClick:event];
 	}];
 }
 
@@ -1074,6 +1851,24 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (NSEvent *)handleEditorHotkey:(NSEvent *)event {
+	if (_captureShortcut && event.window == _preferencesWindow) {
+		NSString *spec = [EditorSettings shortcutSpecForEvent:event];
+		if (spec.length) {
+			NSInteger row = _shortcutTable.selectedRow;
+			if (row < 0 && _shortcutRows.count) {
+				row = 0;
+				[_shortcutTable selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+			}
+			if (row >= 0 && row < (NSInteger)_shortcutRows.count) {
+				_shortcutRows[row][@"keys"] = spec;
+				[_shortcutTable reloadData];
+			}
+			_captureShortcut = NO;
+			NSButton *record = [_preferencesWindow.contentView viewWithTag:822];
+			record.title = NppL(@"Record keys");
+		}
+		return nil;
+	}
 	if (![self editorIsFirstResponder] || _window.attachedSheet) {
 		return event;
 	}
@@ -1084,6 +1879,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		return event;
 	}
 	unichar value = [characters characterAtIndex:0];
+	if (value == '\t' && flags == 0 && [self expandSnippet]) {
+		return nil;
+	}
 	BOOL functionKey = value >= NSF1FunctionKey && value <= NSF35FunctionKey;
 	BOOL commandish = (flags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) != 0;
 	if (!functionKey && !commandish) {
@@ -1130,7 +1928,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (!document || action.length == 0) {
 		return;
 	}
-	NppRunEditorAction(document.editor, action, document.lexerName ?: @"");
+	NppRunEditorAction([self activeEditor] ?: document.editor, action, document.lexerName ?: @"");
 	[self refreshStatus];
 }
 
@@ -1206,7 +2004,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSRect frame = NSMakeRect(0, 0, 1100, 760);
 	_window = [[NSWindow alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
 	_window.releasedWhenClosed = NO;
-	_window.title = @"Notepad++";
+	_window.title = @"Simeiomatarion";
 	_window.delegate = self;
 	_window.minSize = NSMakeSize(640, 420);
 	_window.restorable = NO;
@@ -1237,9 +2035,11 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_findField.placeholderString = @"Find";
 	_findField.target = self;
 	_findField.action = @selector(findNext:);
+	_findField.delegate = (id<NSTextFieldDelegate>)self;
 	_findField.tag = 1;
 	_replaceField = [[NSTextField alloc] initWithFrame:NSZeroRect];
 	_replaceField.placeholderString = @"Replace";
+	_replaceField.delegate = (id<NSTextFieldDelegate>)self;
 	_replaceField.tag = 2;
 	NppChromeView *find = [[NppChromeView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 96)];
 	find.owner = self;
@@ -1264,7 +2064,13 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	replaceAll.tag = 14;
 	NSButton *inFiles = [self button:@"In Files" action:@selector(showReplaceInFiles:) frame:NSZeroRect];
 	inFiles.tag = 15;
-	for (NSButton *button in @[next, previous, replace, replaceAll, inFiles]) {
+	NSButton *findClose = [self button:@"Close" action:@selector(hideFind:) frame:NSZeroRect];
+	findClose.image = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:NppL(@"Close")];
+	findClose.image.size = NSMakeSize(12, 12);
+	findClose.imagePosition = NSImageOnly;
+	findClose.tag = 16;
+	findClose.toolTip = NppL(@"Close");
+	for (NSButton *button in @[next, previous, replace, replaceAll, inFiles, findClose]) {
 		[find addSubview:button];
 	}
 	_workspace.menuBar = _menuBar;
@@ -1277,17 +2083,40 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_compareBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 32)];
 	_compareBar.wantsLayer = YES;
 	_compareBar.layer.backgroundColor = NSColor.controlBackgroundColor.CGColor;
-	_compareLabel = [NSTextField labelWithString:@"Compare"];
+	_compareLabel = [NSTextField labelWithString:NppL(@"Compare")];
 	_compareLabel.tag = 41;
 	_compareLabel.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
 	_compareLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+	NSButton *removedLegend = [NSButton buttonWithTitle:NppL(@"Removed") image:[NSImage imageWithSystemSymbolName:@"minus.circle.fill" accessibilityDescription:NppL(@"Removed")] target:nil action:nil];
+	removedLegend.image.size = NSMakeSize(14, 14);
+	removedLegend.imagePosition = NSImageLeading;
+	removedLegend.bordered = NO;
+	removedLegend.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+	removedLegend.contentTintColor = [NSColor systemPinkColor];
+	removedLegend.tag = 45;
+	NSButton *addedLegend = [NSButton buttonWithTitle:NppL(@"Added") image:[NSImage imageWithSystemSymbolName:@"plus.circle.fill" accessibilityDescription:NppL(@"Added")] target:nil action:nil];
+	addedLegend.image.size = NSMakeSize(14, 14);
+	addedLegend.imagePosition = NSImageLeading;
+	addedLegend.bordered = NO;
+	addedLegend.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+	addedLegend.contentTintColor = [NSColor systemGreenColor];
+	addedLegend.tag = 46;
 	NSButton *comparePrevious = [self button:@"Previous" action:@selector(comparePrevious:) frame:NSZeroRect];
+	comparePrevious.image = [NSImage imageWithSystemSymbolName:@"chevron.up" accessibilityDescription:NppL(@"Previous")];
+	comparePrevious.image.size = NSMakeSize(12, 12);
+	comparePrevious.imagePosition = NSImageLeading;
 	comparePrevious.tag = 42;
 	NSButton *compareNext = [self button:@"Next" action:@selector(compareNext:) frame:NSZeroRect];
+	compareNext.image = [NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:NppL(@"Next")];
+	compareNext.image.size = NSMakeSize(12, 12);
+	compareNext.imagePosition = NSImageLeading;
 	compareNext.tag = 43;
 	NSButton *compareClose = [self button:@"Close" action:@selector(closeCompare:) frame:NSZeroRect];
+	compareClose.image = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:NppL(@"Close")];
+	compareClose.image.size = NSMakeSize(12, 12);
+	compareClose.imagePosition = NSImageLeading;
 	compareClose.tag = 44;
-	for (NSView *view in @[_compareLabel, comparePrevious, compareNext, compareClose]) {
+	for (NSView *view in @[_compareLabel, removedLegend, addedLegend, comparePrevious, compareNext, compareClose]) {
 		[_compareBar addSubview:view];
 	}
 	_workspace.compareBar = _compareBar;
@@ -1318,92 +2147,92 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (NSButton *)button:(NSString *)title action:(SEL)action frame:(NSRect)frame {
-	NSButton *button = [NSButton buttonWithTitle:title target:self action:action];
+	NSButton *button = [NSButton buttonWithTitle:NppL(title) target:self action:action];
 	button.frame = frame;
 	return button;
 }
 
-- (NSButton *)toolButton:(NSString *)symbol tip:(NSString *)tip action:(SEL)action {
-	NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:tip];
+- (NSButton *)toolButton:(NSString *)symbol title:(NSString *)title tip:(NSString *)tip action:(SEL)action {
+	NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:NppL(title)];
 	image.size = NSMakeSize(16, 16);
-	NSButton *button = [NSButton buttonWithImage:image target:self action:action];
-	button.toolTip = tip;
-	button.bezelStyle = NSBezelStyleTexturedRounded;
+	NSButton *button = [NSButton buttonWithTitle:NppL(title) image:image target:self action:action];
+	button.imagePosition = NSImageLeading;
 	button.imageScaling = NSImageScaleProportionallyDown;
+	button.bezelStyle = NSBezelStyleTexturedRounded;
+	button.font = [NSFont systemFontOfSize:12];
+	button.toolTip = NppL(tip);
+	button.identifier = title;
 	button.bordered = YES;
+	[button sizeToFit];
+	NSRect frame = button.frame;
+	frame.size.width = MAX(54, ceil(frame.size.width) + 10);
+	frame.size.height = 30;
+	button.frame = frame;
 	return button;
 }
 
 - (NSView *)buildToolbar {
-	NSView *bar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 42)];
-	NSArray *items = @[
-		@[@"doc.badge.plus", @"New", NSStringFromSelector(@selector(newDocument:))],
-		@[@"folder", @"Open", NSStringFromSelector(@selector(openDocument:))],
-		@[@"square.and.arrow.down", @"Save", NSStringFromSelector(@selector(saveDocument:))],
-		@[@"square.and.arrow.down.on.square", @"Save All", NSStringFromSelector(@selector(saveAllDocuments:))],
-		@[@"xmark", @"Close", NSStringFromSelector(@selector(closeDocument:))],
-		@[@"|"],
-		@[@"arrow.uturn.backward", @"Undo", NSStringFromSelector(@selector(undo:))],
-		@[@"arrow.uturn.forward", @"Redo", NSStringFromSelector(@selector(redo:))],
-		@[@"|"],
-		@[@"scissors", @"Cut", NSStringFromSelector(@selector(cut:))],
-		@[@"doc.on.doc", @"Copy", NSStringFromSelector(@selector(copy:))],
-		@[@"doc.on.clipboard", @"Paste", NSStringFromSelector(@selector(paste:))],
-		@[@"|"],
-		@[@"magnifyingglass", @"Find", NSStringFromSelector(@selector(showFind:))],
-		@[@"doc.text.magnifyingglass", @"Find in Files", NSStringFromSelector(@selector(showFindInFiles:))],
-		@[@"arrow.left.arrow.right", @"Replace", NSStringFromSelector(@selector(showReplace:))],
-		@[@"tail", @"Tail", NSStringFromSelector(@selector(toggleMonitoring:))],
-		@[@"rectangle.split.2x1", @"Split", NSStringFromSelector(@selector(splitRight:))],
-		@[@"|"],
-		@[@"record.circle", @"Record Macro", NSStringFromSelector(@selector(startMacro:))],
-		@[@"stop.circle", @"Stop Macro", NSStringFromSelector(@selector(stopMacro:))],
-		@[@"play.circle", @"Play Macro", NSStringFromSelector(@selector(playMacro:))]
+	NSView *bar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 72)];
+	bar.clipsToBounds = YES;
+	NSArray *rows = @[
+		@[
+			@[@"doc.badge.plus", @"New", @"New", NSStringFromSelector(@selector(newDocument:))],
+			@[@"folder", @"Open", @"Open", NSStringFromSelector(@selector(openDocument:))],
+			@[@"square.and.arrow.down", @"Save", @"Save", NSStringFromSelector(@selector(saveDocument:))],
+			@[@"square.and.arrow.down.on.square", @"All", @"Save All", NSStringFromSelector(@selector(saveAllDocuments:))],
+			@[@"xmark", @"Close", @"Close", NSStringFromSelector(@selector(closeDocument:))],
+			@[@"|"],
+			@[@"arrow.uturn.backward", @"Undo", @"Undo", NSStringFromSelector(@selector(undo:))],
+			@[@"arrow.uturn.forward", @"Redo", @"Redo", NSStringFromSelector(@selector(redo:))],
+			@[@"|"],
+			@[@"scissors", @"Cut", @"Cut", NSStringFromSelector(@selector(cut:))],
+			@[@"doc.on.doc", @"Copy", @"Copy", NSStringFromSelector(@selector(copy:))],
+			@[@"doc.on.clipboard", @"Paste", @"Paste", NSStringFromSelector(@selector(paste:))],
+			@[@"|"],
+			@[@"magnifyingglass", @"Find", @"Find", NSStringFromSelector(@selector(showFind:))],
+			@[@"doc.text.magnifyingglass", @"Files", @"Find in Files", NSStringFromSelector(@selector(showFindInFiles:))],
+			@[@"arrow.left.arrow.right", @"Replace", @"Replace", NSStringFromSelector(@selector(showReplace:))]
+		],
+		@[
+			@[@"curlybraces", @"Format JSON", @"Format JSON", NSStringFromSelector(@selector(formatJSON:))],
+			@[@"chevron.left.forwardslash.chevron.right", @"Format XML", @"Format XML", NSStringFromSelector(@selector(formatXML:))],
+			@[@"plus.forwardslash.minus", @"Compare", @"Compare Panes", NSStringFromSelector(@selector(comparePanes:))],
+			@[@"|"],
+			@[@"text.append", @"Tail", @"Start tail -f", NSStringFromSelector(@selector(toggleMonitoring:))],
+			@[@"rectangle.split.2x1", @"Split", @"Split the tabs to the right into a new pane", NSStringFromSelector(@selector(splitRight:))],
+			@[@"|"],
+			@[@"record.circle", @"Record", @"Record Macro", NSStringFromSelector(@selector(startMacro:))],
+			@[@"stop.circle", @"Stop", @"Stop Macro", NSStringFromSelector(@selector(stopMacro:))],
+			@[@"play.circle", @"Play", @"Play Macro", NSStringFromSelector(@selector(playMacro:))]
+		]
 	];
-	CGFloat x = 8;
-	for (NSArray *item in items) {
-		if ([item[0] isEqualToString:@"|"]) {
-			NSBox *rule = [[NSBox alloc] initWithFrame:NSMakeRect(x + 4, 8, 1, 26)];
-			rule.boxType = NSBoxSeparator;
-			[bar addSubview:rule];
-			x += 14;
-			continue;
-		}
-		if ([item[0] isEqualToString:@"tail"]) {
-			NSImage *image = [NSImage imageWithSystemSymbolName:@"text.append" accessibilityDescription:@"Tail"];
-			image.size = NSMakeSize(14, 14);
-			NSButton *button = [NSButton buttonWithTitle:@"Tail" image:image target:self action:@selector(toggleMonitoring:)];
-			button.imagePosition = NSImageLeading;
-			button.imageScaling = NSImageScaleProportionallyDown;
-			button.bezelStyle = NSBezelStyleTexturedRounded;
-			button.font = [NSFont systemFontOfSize:12];
-			button.buttonType = NSButtonTypeToggle;
-			button.toolTip = @"Start tail -f";
-			button.frame = NSMakeRect(x, 6, 78, 30);
-			_tailButton = button;
+	for (NSInteger rowIndex = 0; rowIndex < (NSInteger)rows.count; rowIndex++) {
+		CGFloat y = (rows.count - 1 - rowIndex) * 36 + 4;
+		CGFloat x = 8;
+		for (NSArray *item in rows[rowIndex]) {
+			if ([item[0] isEqualToString:@"|"]) {
+				NSBox *rule = [[NSBox alloc] initWithFrame:NSMakeRect(x + 4, y + 1, 1, 28)];
+				rule.boxType = NSBoxSeparator;
+				[bar addSubview:rule];
+				x += 14;
+				continue;
+			}
+			NSButton *button = [self toolButton:item[0] title:item[1] tip:item[2] action:NSSelectorFromString(item[3])];
+			if ([item[1] isEqualToString:@"Tail"]) {
+				button.buttonType = NSButtonTypeToggle;
+				_tailButton = button;
+			}
+			if ([item[1] isEqualToString:@"Format JSON"] || [item[1] isEqualToString:@"Format XML"]) {
+				button.enabled = _settings.formatDocuments;
+			}
+			NSRect frame = button.frame;
+			frame.origin = NSMakePoint(x, y);
+			button.frame = frame;
 			[bar addSubview:button];
-			x += 84;
-			continue;
+			x += frame.size.width + 4;
 		}
-		if ([item[0] isEqualToString:@"rectangle.split.2x1"]) {
-			NSImage *image = [NSImage imageWithSystemSymbolName:@"rectangle.split.2x1" accessibilityDescription:@"Split"];
-			image.size = NSMakeSize(14, 14);
-			NSButton *button = [NSButton buttonWithTitle:@"Split" image:image target:self action:@selector(splitRight:)];
-			button.imagePosition = NSImageLeading;
-			button.imageScaling = NSImageScaleProportionallyDown;
-			button.bezelStyle = NSBezelStyleTexturedRounded;
-			button.font = [NSFont systemFontOfSize:12];
-			button.toolTip = @"Split the tabs to the right into a new pane";
-			button.frame = NSMakeRect(x, 6, 78, 30);
-			[bar addSubview:button];
-			x += 84;
-			continue;
-		}
-		NSButton *button = [self toolButton:item[0] tip:item[1] action:NSSelectorFromString(item[2])];
-		button.frame = NSMakeRect(x, 6, 32, 30);
-		[bar addSubview:button];
-		x += 36;
 	}
+	bar.identifier = @"toolbar";
 	return bar;
 }
 
@@ -1430,21 +2259,20 @@ static void HostStatus(NppMacHost *host, const char *text) {
 			NSString *name = document.title ?: @"Untitled";
 			NSFont *font = current ? [NSFont boldSystemFontOfSize:12] : [NSFont systemFontOfSize:12];
 			NSColor *textColor = current ? NSColor.labelColor : NSColor.secondaryLabelColor;
-			NSAttributedString *title = [[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:name] attributes:@{
-				NSFontAttributeName: font,
-				NSForegroundColorAttributeName: textColor
-			}];
+			NSString *kind = nil;
+			NSView *badge = NppFileBadge(document, &kind);
+			CGFloat natural = ceil([name sizeWithAttributes:@{NSFontAttributeName: font}].width);
+			CGFloat width = MIN(240, MAX(148, natural + 64));
 			NppTabButton *button = [[NppTabButton alloc] initWithFrame:NSZeroRect];
 			button.buttonType = NSButtonTypeMomentaryPushIn;
-			button.attributedTitle = title;
-			button.alignment = NSTextAlignmentLeft;
+			button.title = @"";
 			button.target = self;
 			button.owner = self;
 			button.document = document;
 			button.action = @selector(selectTabButton:);
 			button.bordered = NO;
-			[button sizeToFit];
-			CGFloat width = MAX(110, MIN(220, button.frame.size.width + 30));
+			NSString *location = document.path.length ? document.path : name;
+			button.toolTip = kind.length ? [NSString stringWithFormat:@"%@\n%@", location, kind] : location;
 			NppTabChip *chip = [[NppTabChip alloc] initWithFrame:NSMakeRect(x, 2, width, 24)];
 			chip.document = document;
 			chip.wantsLayer = YES;
@@ -1457,20 +2285,36 @@ static void HostStatus(NppMacHost *host, const char *text) {
 				chip.layer.borderWidth = 1;
 				chip.layer.borderColor = NSColor.separatorColor.CGColor;
 			}
+			badge.frame = NSMakeRect(5, 4, 18, 16);
 			button.frame = NSMakeRect(0, 0, width, 24);
+			CGFloat labelWidth = MAX(24, width - 52);
+			NppTabLabel *label = [[NppTabLabel alloc] initWithFrame:NSMakeRect(26, 2, labelWidth, 20)];
+			label.text = NppFitTitle(name, font, labelWidth);
+			label.font = font;
+			label.textColor = textColor;
+			label.toolTip = button.toolTip;
 			NppTabCloseButton *close = [[NppTabCloseButton alloc] initWithFrame:NSMakeRect(width - 22, 2, 18, 20)];
 			close.bordered = NO;
 			close.title = @"×";
-			close.contentTintColor = textColor;
+			close.contentTintColor = document.dirty ? NSColor.systemOrangeColor : textColor;
 			close.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
 			close.target = self;
 			close.action = @selector(closeTabButton:);
 			close.document = document;
 			close.toolTip = @"Close";
+			chip.clipsToBounds = YES;
 			[chip addSubview:button];
+			[chip addSubview:badge];
+			[chip addSubview:label];
 			[chip addSubview:close];
 			[bar addSubview:chip];
 			x += width + 4;
+		}
+		[bar noteContentWidth:x + 6];
+		DocumentTab *currentDocument = [visible isKindOfClass:[DocumentTab class]] ? visible : nil;
+		if (currentDocument != bar.anchoredDocument) {
+			bar.anchoredDocument = currentDocument;
+			[bar revealDocument:currentDocument];
 		}
 		bar.dropIndex = dropIndex;
 	}
@@ -1511,16 +2355,46 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)selectTabButton:(NSButton *)sender {
 	DocumentTab *document = [sender isKindOfClass:[NppTabButton class]] ? ((NppTabButton *)sender).document : nil;
-	if (document) {
-		[self showDocument:document inPane:[self paneIndexOfDocument:document]];
+	if (!document) {
+		[self rebuildTabStrip];
 		return;
 	}
-	[self rebuildTabStrip];
+	NSInteger pane = [self paneIndexContainingView:sender];
+	if (document == _cloneSource && pane == _clonePane) {
+		[self focusClone];
+		return;
+	}
+	[self showDocument:document inPane:pane == NSNotFound ? [self paneIndexOfDocument:document] : pane];
+}
+
+- (void)forceCloseTab:(DocumentTab *)document fromView:(NSView *)view {
+	if (![document isKindOfClass:[DocumentTab class]]) {
+		return;
+	}
+	NSInteger pane = view ? [self paneIndexContainingView:view] : [self paneIndexOfDocument:document];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (document == self->_cloneSource && pane == self->_clonePane) {
+			[self dropClone];
+			return;
+		}
+		if (![self->_documents containsObject:document]) {
+			return;
+		}
+		[self showDocument:document inPane:pane];
+		self->_closingWithoutPrompt = YES;
+		[self closeDocument:nil];
+		self->_closingWithoutPrompt = NO;
+	});
 }
 
 - (void)closeTabButton:(NSButton *)sender {
 	DocumentTab *document = [sender isKindOfClass:[NppTabCloseButton class]] ? ((NppTabCloseButton *)sender).document : nil;
 	if (!document) {
+		return;
+	}
+	NSInteger pane = [self paneIndexContainingView:sender];
+	if (document == _cloneSource && pane == _clonePane) {
+		[self dropClone];
 		return;
 	}
 	[self showDocument:document inPane:[self paneIndexOfDocument:document]];
@@ -1569,9 +2443,29 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_filesRegex = [self check:@"Regex" frame:NSZeroRect];
 	_filesSubfolders = [self check:@"In subfolders" frame:NSZeroRect];
 	_filesSubfolders.state = NSControlStateValueOn;
+	_findProgress = [[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
+	_findProgress.style = NSProgressIndicatorStyleBar;
+	_findProgress.indeterminate = YES;
+	_findProgress.displayedWhenStopped = NO;
+	_findProgress.controlSize = NSControlSizeSmall;
+	_findProgressLabel = [NSTextField labelWithString:@""];
+	_findProgressLabel.font = [NSFont systemFontOfSize:11];
+	_findProgressLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+	_findProgressLabel.tag = 35;
+	_findProgressLabel.hidden = YES;
+	_findCancel = [self button:@"Cancel" action:@selector(cancelFindInFiles:) frame:NSZeroRect];
+	_findCancel.tag = 29;
+	_findCancel.hidden = YES;
 	_resultsScroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
 	_resultsScroll.hasVerticalScroller = YES;
+	_resultsScroll.hasHorizontalScroller = YES;
+	_resultsScroll.autohidesScrollers = NO;
 	_resultsTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+	_resultsTable.style = NSTableViewStyleFullWidth;
+	_resultsTable.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
+	_resultsTable.gridStyleMask = NSTableViewSolidHorizontalGridLineMask;
+	_resultsTable.gridColor = NSColor.separatorColor;
+	_resultsTable.intercellSpacing = NSMakeSize(6, 1);
 	NSTableColumn *closeColumn = [[NSTableColumn alloc] initWithIdentifier:@"close"];
 	closeColumn.title = @"";
 	closeColumn.width = 28;
@@ -1595,9 +2489,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		column.title = columnInfo[1];
 		column.width = [columnInfo[2] doubleValue];
 		column.minWidth = [columnInfo[0] isEqualToString:@"line"] ? 48 : 120;
-		if ([columnInfo[0] isEqualToString:@"text"]) {
-			column.resizingMask = NSTableColumnAutoresizingMask;
-		}
+		column.resizingMask = NSTableColumnUserResizingMask;
 		[_resultsTable addTableColumn:column];
 	}
 	_resultsTable.dataSource = self;
@@ -1605,7 +2497,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_resultsTable.target = self;
 	_resultsTable.doubleAction = @selector(openSearchHit:);
 	_resultsScroll.documentView = _resultsTable;
-	for (NSView *view in @[findLabel, _filesQuery, replaceLabel, _filesReplace, filterLabel, _filesFilters, dirLabel, _filesDirectory, browse, findAll, replaceFiles, close, _filesCase, _filesWord, _filesRegex, _filesSubfolders, _resultsScroll]) {
+	for (NSView *view in @[findLabel, _filesQuery, replaceLabel, _filesReplace, filterLabel, _filesFilters, dirLabel, _filesDirectory, browse, findAll, replaceFiles, close, _filesCase, _filesWord, _filesRegex, _filesSubfolders, _findProgress, _findProgressLabel, _findCancel, _resultsScroll]) {
 		[panel addSubview:view];
 	}
 	return panel;
@@ -1623,7 +2515,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 - (void)layoutFindBar {
 	NSView *bar = _workspace.findBar;
 	CGFloat width = MAX(640, bar.bounds.size.width);
-	CGFloat field = MAX(140, MIN(360, width - 560));
+	CGFloat field = MAX(140, MIN(360, width - 600));
 	_findField.frame = NSMakeRect(8, 58, field, 24);
 	_replaceField.frame = NSMakeRect(8, 18, field, 24);
 	CGFloat x = NSMaxX(_findField.frame) + 8;
@@ -1639,6 +2531,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		button.frame = NSMakeRect(x, 58, [info[1] doubleValue], 24);
 		x += [info[1] doubleValue] + 6;
 	}
+	NSView *findClose = [self chromeTagged:16 in:bar];
+	findClose.frame = NSMakeRect(width - 36, 58, 28, 24);
 	x = NSMaxX(_replaceField.frame) + 8;
 	for (NSButton *box in @[_matchCase, _wholeWord, _regex, _wrap, _dotAll]) {
 		[box sizeToFit];
@@ -1654,7 +2548,6 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSView *panel = _resultsPanel;
 	CGFloat width = MAX(640, panel.bounds.size.width);
 	CGFloat height = panel.bounds.size.height;
-	CGFloat form = 112;
 	NSView *findLabel = [self chromeTagged:31 in:panel];
 	NSView *replaceLabel = [self chromeTagged:32 in:panel];
 	NSView *filterLabel = [self chromeTagged:33 in:panel];
@@ -1684,6 +2577,15 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		box.frame = frame;
 		x += frame.size.width + 10;
 	}
+	BOOL searching = _findCancel && !_findCancel.hidden;
+	CGFloat form = searching ? 148 : 112;
+	_findProgress.hidden = !searching;
+	_findProgressLabel.hidden = !searching;
+	if (searching) {
+		_findCancel.frame = NSMakeRect(width - 92, height - 136, 80, 24);
+		_findProgress.frame = NSMakeRect(8, height - 128, 140, 12);
+		_findProgressLabel.frame = NSMakeRect(156, height - 136, MAX(80, width - 256), 22);
+	}
 	_resultsScroll.frame = NSMakeRect(0, 0, width, MAX(40, height - form));
 }
 
@@ -1697,7 +2599,10 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	CGFloat x = 6;
 	for (NSMenuItem *top in NSApp.mainMenu.itemArray) {
 		NSString *title = top.submenu.title.length ? top.submenu.title : top.title;
-		if (title.length == 0 || !top.submenu) {
+		if ([title isEqualToString:@"NSMenuItem"] || title.length == 0) {
+			title = top.submenu.identifier.length ? top.submenu.identifier : @"Simeiomatarion";
+		}
+		if (!top.submenu || title.length == 0) {
 			continue;
 		}
 		NSPopUpButton *button = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
@@ -1721,15 +2626,194 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	}
 }
 
+static NSString *NppMenuSymbol(NSString *title) {
+	static NSDictionary<NSString *, NSString *> *symbols;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		symbols = @{
+			@"About Simeiomatarion": @"info.circle",
+			@"Add Next Occurrence": @"plus.magnifyingglass",
+			@"All": @"square.and.arrow.down.on.square",
+			@"Always on Top": @"pin",
+			@"Automatic": @"wand.and.stars",
+			@"Bookmark": @"bookmark",
+			@"Character Panel…": @"textformat.abc",
+			@"Character sets": @"textformat",
+			@"Clear All Bookmarks": @"bookmark.slash",
+			@"Clipboard History…": @"list.clipboard",
+			@"CSV Table": @"tablecells",
+			@"Clone Beside": @"plus.rectangle.on.rectangle",
+			@"Close": @"xmark",
+			@"Close All": @"xmark.circle",
+			@"Close All but Active": @"xmark.rectangle",
+			@"Close All but This": @"xmark.rectangle",
+			@"Close Split": @"rectangle",
+			@"Close Tab": @"xmark",
+			@"Column Editor…": @"tablecells.badge.ellipsis",
+			@"Column Mode": @"tablecells",
+			@"Compare": @"plus.forwardslash.minus",
+			@"Compare Panes": @"plus.forwardslash.minus",
+			@"Convert Case to": @"textformat",
+			@"Copy": @"doc.on.doc",
+			@"Copy Filename": @"doc.text",
+			@"Copy Full File Path": @"doc.on.clipboard",
+			@"Cut": @"scissors",
+			@"Dark": @"moon.fill",
+			@"Decrease Line Indent": @"decrease.indent",
+			@"Delete": @"trash",
+			@"Delete Current Line": @"trash",
+			@"Duplicate Current Line": @"plus.square.on.square",
+			@"Find": @"magnifyingglass",
+			@"Find Next": @"arrow.down",
+			@"Find Previous": @"arrow.up",
+			@"Find in Files": @"doc.text.magnifyingglass",
+			@"Find in Files…": @"doc.text.magnifyingglass",
+			@"Find…": @"magnifyingglass",
+			@"Files": @"doc.text.magnifyingglass",
+			@"Fold All": @"chevron.down",
+			@"Fold Current Level": @"chevron.down.circle",
+			@"Folder Sidebar": @"sidebar.left",
+			@"Format JSON": @"curlybraces",
+			@"Format XML": @"chevron.left.forwardslash.chevron.right",
+			@"Go to Line…": @"number",
+			@"Go to Matching Brace": @"curlybraces",
+			@"Increase Line Indent": @"increase.indent",
+			@"Indent": @"increase.indent",
+			@"Insert Date Time": @"calendar",
+			@"Join Lines": @"arrow.down.to.line.compact",
+			@"Line Numbers": @"list.number",
+			@"Line Operations": @"text.alignleft",
+			@"Minimap": @"map",
+			@"Monitoring (tail -f)": @"text.append",
+			@"Move Line Down": @"arrow.down",
+			@"Move Line Up": @"arrow.up",
+			@"New": @"doc.badge.plus",
+			@"New Window": @"macwindow.badge.plus",
+			@"Next Bookmark": @"bookmark",
+			@"Next Tab": @"chevron.right",
+			@"No commands": @"puzzlepiece",
+			@"No plugins loaded": @"puzzlepiece",
+			@"No recent files": @"clock",
+			@"No recent searches": @"clock",
+			@"No saved sessions": @"archivebox",
+			@"Open Folder…": @"folder.badge.plus",
+			@"Open Plugins Folder": @"folder",
+			@"Open Quickly…": @"magnifyingglass",
+			@"Open Recent": @"clock.arrow.circlepath",
+			@"Open…": @"folder",
+			@"Outline": @"list.bullet.indent",
+			@"Paste": @"doc.on.clipboard",
+			@"Pin Tab": @"pin",
+			@"Play": @"play.circle",
+			@"Playback": @"play.circle",
+			@"Preferences…": @"gearshape",
+			@"Preview": @"eye",
+			@"Previous Bookmark": @"bookmark",
+			@"Previous Tab": @"chevron.left",
+			@"Print…": @"printer",
+			@"Quit Simeiomatarion": @"power",
+			@"Read-Only": @"lock",
+			@"Record": @"record.circle",
+			@"Redo": @"arrow.uturn.forward",
+			@"Reload Plugins": @"arrow.clockwise",
+			@"Reload from Disk": @"arrow.clockwise",
+			@"Remove Bookmarked Lines": @"trash",
+			@"Remove Duplicate Lines": @"minus.square",
+			@"Remove Empty Lines": @"line.3.horizontal.decrease",
+			@"Replace": @"arrow.left.arrow.right",
+			@"Replace All": @"arrow.triangle.2.circlepath",
+			@"Replace in Files…": @"arrow.left.arrow.right.square",
+			@"Replace…": @"arrow.left.arrow.right",
+			@"Restore Default Zoom": @"arrow.counterclockwise",
+			@"Reveal in Finder": @"arrow.up.forward.app",
+			@"Reverse Line Order": @"arrow.up.arrow.down",
+			@"Run a Macro Multiple Times…": @"repeat",
+			@"Save": @"square.and.arrow.down",
+			@"Save All": @"square.and.arrow.down.on.square",
+			@"Save As…": @"square.and.arrow.down.on.square",
+			@"Save Current Macro…": @"square.and.arrow.down",
+			@"Save Session…": @"archivebox",
+			@"Search History": @"clock",
+			@"Select All": @"selection.pin.in.out",
+			@"Select and Find Next": @"text.magnifyingglass",
+			@"Sessions": @"archivebox",
+			@"Show End of Line": @"return",
+			@"Show Indent Guide": @"list.dash",
+			@"Show Whitespace": @"space",
+			@"Snippets…": @"note.text",
+			@"Sort Lines Ascending": @"arrow.up",
+			@"Sort Lines Descending": @"arrow.down",
+			@"Split": @"rectangle.split.2x1",
+			@"Split Left": @"rectangle.split.2x1",
+			@"Split Lines": @"text.line.first.and.arrowtriangle.forward",
+			@"Split Right": @"rectangle.split.2x1",
+			@"Start Recording": @"record.circle",
+			@"Start tail -f": @"text.append",
+			@"Stop": @"stop.circle",
+			@"Stop Recording": @"stop.circle",
+			@"Stop tail -f": @"text.append",
+			@"Summary…": @"list.bullet",
+			@"Sync Scrolling": @"arrow.up.and.down",
+			@"System": @"circle.lefthalf.filled",
+			@"TAB to Space": @"arrow.left.and.right",
+			@"Tail": @"text.append",
+			@"Toggle Bookmark": @"bookmark",
+			@"Toggle Line Comment": @"text.bubble",
+			@"Toggle Recording": @"record.circle",
+			@"Trim Trailing Space": @"delete.right",
+			@"UPPERCASE": @"textformat.size",
+			@"Undo": @"arrow.uturn.backward",
+			@"Unfold All": @"chevron.right",
+			@"Unix (LF)": @"return",
+			@"Unpin Tab": @"pin.slash",
+			@"User Languages…": @"person.crop.rectangle",
+			@"White": @"sun.max",
+			@"Windows (CRLF)": @"return",
+			@"Word Wrap": @"arrow.turn.down.left",
+			@"Zoom In": @"plus.magnifyingglass",
+			@"Zoom Out": @"minus.magnifyingglass",
+			@"iNVERT cASE": @"textformat.alt",
+			@"lowercase": @"textformat"
+		};
+	});
+	return symbols[title];
+}
+
+- (void)applyMenuIcon:(NSString *)symbol toItem:(NSMenuItem *)item {
+	if (symbol.length == 0 || item == nil) {
+		return;
+	}
+	NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:item.title];
+	if (!image) {
+		return;
+	}
+	NSImageSymbolConfiguration *config = [NSImageSymbolConfiguration configurationWithPointSize:13 weight:NSFontWeightRegular];
+	image = [image imageWithSymbolConfiguration:config] ?: image;
+	[image setTemplate:YES];
+	item.image = image;
+	// macOS 27 hides SF Symbol menu images unless visibility is requested.
+	SEL visibility = NSSelectorFromString(@"setPreferredImageVisibility:");
+	if ([item respondsToSelector:visibility]) {
+		NSInteger visible = 1;
+		NSMethodSignature *signature = [item methodSignatureForSelector:visibility];
+		NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+		invocation.target = item;
+		invocation.selector = visibility;
+		[invocation setArgument:&visible atIndex:2];
+		[invocation invoke];
+	}
+}
+
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action command:(NSString *)command {
 	NSString *spec = command ? [_settings shortcutForCommand:command] : @"";
 	NSString *key = @"";
 	NSEventModifierFlags flags = 0;
 	[EditorSettings parseShortcut:spec key:&key modifiers:&flags];
-	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
+	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:NppL(title) action:action keyEquivalent:key];
 	item.keyEquivalentModifierMask = flags;
 	item.target = self;
 	item.representedObject = command;
+	[self applyMenuIcon:NppMenuSymbol(title) toItem:item];
 	return item;
 }
 
@@ -1739,10 +2823,11 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (command.length) {
 		[EditorSettings parseShortcut:[_settings shortcutForCommand:command] key:&key modifiers:&flags];
 	}
-	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(editorAction:) keyEquivalent:key];
+	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:NppL(title) action:@selector(editorAction:) keyEquivalent:key];
 	item.keyEquivalentModifierMask = flags;
 	item.target = self;
 	item.representedObject = action;
+	[self applyMenuIcon:NppMenuSymbol(title) toItem:item];
 	return item;
 }
 
@@ -1755,27 +2840,35 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (!document || ![sender.representedObject isKindOfClass:[NSString class]]) {
 		return;
 	}
+	if ([sender.representedObject isEqualToString:@"zoomReset"]) {
+		[self nudgeVisibleZoom:0 target:[self zoomTargetUnderHit:nil]];
+		return;
+	}
 	NppRunEditorAction(document.editor, sender.representedObject, document.lexerName ?: @"");
 	[self refreshStatus];
 }
 
 - (void)buildMenus {
 	NSMenu *bar = [NSMenu new];
-	NSMenu *appMenu = [NSMenu new];
-	[appMenu addItem:[self item:@"About Notepad++" action:@selector(showAbout:) command:nil]];
+	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Simeiomatarion"];
+	[appMenu addItem:[self item:@"About Simeiomatarion" action:@selector(showAbout:) command:nil]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
 	[appMenu addItem:[self item:@"Preferences…" action:@selector(showPreferences:) command:@"preferences"]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
-	NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit Notepad++" action:@selector(terminate:) keyEquivalent:@"q"];
+	NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit Simeiomatarion" action:@selector(terminate:) keyEquivalent:@"q"];
 	quit.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+	[self applyMenuIcon:NppMenuSymbol(@"Quit Simeiomatarion") toItem:quit];
 	[appMenu addItem:quit];
-	NSMenuItem *appItem = [NSMenuItem new];
+	NSMenuItem *appItem = [[NSMenuItem alloc] initWithTitle:@"Simeiomatarion" action:nil keyEquivalent:@""];
 	appItem.submenu = appMenu;
 	[bar addItem:appItem];
 
 	NSMenu *file = [NSMenu new];
 	file.title = @"File";
 	[file addItem:[self item:@"New" action:@selector(newDocument:) command:@"new"]];
+	NSMenuItem *newWindow = [self item:@"New Window" action:@selector(newWindow:) command:nil];
+	newWindow.enabled = _settings.extraWindows;
+	[file addItem:newWindow];
 	[file addItem:[self item:@"Open…" action:@selector(openDocument:) command:@"open"]];
 	[file addItem:[self item:@"Open Folder…" action:@selector(openFolder:) command:@"openFolder"]];
 	[file addItem:[self item:@"Open Quickly…" action:@selector(showQuickOpen:) command:@"quickOpen"]];
@@ -1795,8 +2888,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	recent.title = @"Open Recent";
 	NSArray *paths = [[NSUserDefaults standardUserDefaults] arrayForKey:@"recentFiles"];
 	if (paths.count == 0) {
-		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:@"No recent files" action:nil keyEquivalent:@""];
+		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:NppL(@"No recent files") action:nil keyEquivalent:@""];
 		none.enabled = NO;
+		[self applyMenuIcon:NppMenuSymbol(@"No recent files") toItem:none];
 		[recent addItem:none];
 	}
 	for (NSString *path in paths) {
@@ -1804,11 +2898,33 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		item.target = self;
 		item.representedObject = path;
 		item.toolTip = path;
+		[self applyMenuIcon:@"doc" toItem:item];
 		[recent addItem:item];
 	}
 	NSMenuItem *recentItem = [[NSMenuItem alloc] initWithTitle:@"Open Recent" action:nil keyEquivalent:@""];
 	recentItem.submenu = recent;
+	[self applyMenuIcon:NppMenuSymbol(@"Open Recent") toItem:recentItem];
 	[file addItem:recentItem];
+	NSMenu *sessions = [NSMenu new];
+	[sessions addItem:[self item:@"Save Session…" action:@selector(saveNamedSession:) command:nil]];
+	NSArray<NSString *> *sessionNames = [self namedSessionTitles];
+	if (sessionNames.count == 0) {
+		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:NppL(@"No saved sessions") action:nil keyEquivalent:@""];
+		none.enabled = NO;
+		[self applyMenuIcon:NppMenuSymbol(@"No saved sessions") toItem:none];
+		[sessions addItem:none];
+	}
+	for (NSString *name in sessionNames) {
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:@selector(openNamedSession:) keyEquivalent:@""];
+		item.target = self;
+		item.representedObject = name;
+		[self applyMenuIcon:@"archivebox" toItem:item];
+		[sessions addItem:item];
+	}
+	NSMenuItem *sessionItem = [[NSMenuItem alloc] initWithTitle:@"Sessions" action:nil keyEquivalent:@""];
+	sessionItem.submenu = sessions;
+	[self applyMenuIcon:NppMenuSymbol(@"Sessions") toItem:sessionItem];
+	[file addItem:sessionItem];
 	[self addMenu:file title:@"File" to:bar];
 
 	NSMenu *edit = [NSMenu new];
@@ -1835,12 +2951,14 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[lines addItem:[self actionItem:@"Reverse Line Order" action:@"reverse"]];
 	NSMenuItem *lineItem = [[NSMenuItem alloc] initWithTitle:@"Line Operations" action:nil keyEquivalent:@""];
 	lineItem.submenu = lines;
+	[self applyMenuIcon:NppMenuSymbol(@"Line Operations") toItem:lineItem];
 	[edit addItem:lineItem];
 	NSMenu *indent = [NSMenu new];
 	[indent addItem:[self actionItem:@"Increase Line Indent" action:@"indent"]];
 	[indent addItem:[self actionItem:@"Decrease Line Indent" action:@"outdent"]];
 	NSMenuItem *indentItem = [[NSMenuItem alloc] initWithTitle:@"Indent" action:nil keyEquivalent:@""];
 	indentItem.submenu = indent;
+	[self applyMenuIcon:NppMenuSymbol(@"Indent") toItem:indentItem];
 	[edit addItem:indentItem];
 	NSMenu *convert = [NSMenu new];
 	[convert addItem:[self actionItem:@"UPPERCASE" action:@"upper" command:@"upper"]];
@@ -1848,6 +2966,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[convert addItem:[self actionItem:@"iNVERT cASE" action:@"invert"]];
 	NSMenuItem *convertItem = [[NSMenuItem alloc] initWithTitle:@"Convert Case to" action:nil keyEquivalent:@""];
 	convertItem.submenu = convert;
+	[self applyMenuIcon:NppMenuSymbol(@"Convert Case to") toItem:convertItem];
 	[edit addItem:convertItem];
 	[edit addItem:[self actionItem:@"Toggle Line Comment" action:@"comment" command:@"comment"]];
 	[edit addItem:[self actionItem:@"Trim Trailing Space" action:@"trim"]];
@@ -1857,6 +2976,19 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[edit addItem:[self item:@"Copy Full File Path" action:@selector(copyFullPath:) command:nil]];
 	[edit addItem:[self item:@"Copy Filename" action:@selector(copyFilename:) command:nil]];
 	[edit addItem:[NSMenuItem separatorItem]];
+	[edit addItem:[self item:@"Add Next Occurrence" action:@selector(addNextOccurrence:) command:@"addNext"]];
+	[edit addItem:[self item:@"Clipboard History…" action:@selector(showClipboardHistory:) command:@"clipboardHistory"]];
+	[edit addItem:[self item:@"Snippets…" action:@selector(showSnippets:) command:@"snippets"]];
+	NSMenuItem *formatJSON = [self item:@"Format JSON" action:@selector(formatJSON:) command:nil];
+	formatJSON.enabled = _settings.formatDocuments;
+	[edit addItem:formatJSON];
+	NSMenuItem *formatXML = [self item:@"Format XML" action:@selector(formatXML:) command:nil];
+	formatXML.enabled = _settings.formatDocuments;
+	[edit addItem:formatXML];
+	NSMenuItem *characters = [self item:@"Character Panel…" action:@selector(showCharacterPanel:) command:nil];
+	characters.enabled = _settings.showCharacterPanel;
+	[edit addItem:characters];
+	[edit addItem:[self item:@"Pin Tab" action:@selector(togglePin:) command:@"pin"]];
 	[edit addItem:[self actionItem:@"Column Mode" action:@"rectangle" command:@"column"]];
 	[edit addItem:[self item:@"Column Editor…" action:@selector(columnEditor:) command:nil]];
 	[edit addItem:[self actionItem:@"Read-Only" action:@"readonly"]];
@@ -1868,6 +3000,25 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[search addItem:[self item:@"Replace in Files…" action:@selector(showReplaceInFiles:) command:nil]];
 	[search addItem:[self item:@"Find Next" action:@selector(findNext:) command:@"findNext"]];
 	[search addItem:[self item:@"Find Previous" action:@selector(findPrevious:) command:@"findPrev"]];
+	NSMenu *history = [NSMenu new];
+	history.title = NppL(@"Search History");
+	if (_settings.searchHistory.count == 0) {
+		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:NppL(@"No recent searches") action:nil keyEquivalent:@""];
+		none.enabled = NO;
+		[self applyMenuIcon:NppMenuSymbol(@"No recent searches") toItem:none];
+		[history addItem:none];
+	}
+	for (NSString *query in _settings.searchHistory) {
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:query action:@selector(findFromHistory:) keyEquivalent:@""];
+		item.target = self;
+		item.representedObject = query;
+		[self applyMenuIcon:@"magnifyingglass" toItem:item];
+		[history addItem:item];
+	}
+	NSMenuItem *historyItem = [[NSMenuItem alloc] initWithTitle:NppL(@"Search History") action:nil keyEquivalent:@""];
+	historyItem.submenu = history;
+	[self applyMenuIcon:NppMenuSymbol(@"Search History") toItem:historyItem];
+	[search addItem:historyItem];
 	[search addItem:[self item:@"Replace…" action:@selector(showReplace:) command:@"replace"]];
 	[search addItem:[self item:@"Replace All" action:@selector(replaceAll:) command:nil]];
 	[search addItem:[NSMenuItem separatorItem]];
@@ -1882,10 +3033,23 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[bookmarks addItem:[self actionItem:@"Remove Bookmarked Lines" action:@"bookmarkDelete"]];
 	NSMenuItem *bookmarkItem = [[NSMenuItem alloc] initWithTitle:@"Bookmark" action:nil keyEquivalent:@""];
 	bookmarkItem.submenu = bookmarks;
+	[self applyMenuIcon:NppMenuSymbol(@"Bookmark") toItem:bookmarkItem];
 	[search addItem:bookmarkItem];
 	[self addMenu:search title:@"Search" to:bar];
 
 	NSMenu *view = [NSMenu new];
+	NSArray *appearances = @[@"System", @"White", @"Dark"];
+	for (NSInteger index = 0; index < 3; index++) {
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:NppL(appearances[index]) action:@selector(chooseAppearance:) keyEquivalent:@""];
+		item.target = self;
+		item.tag = index;
+		NSString *theme = _settings.theme ?: @"system";
+		NSInteger selected = [theme isEqualToString:@"light"] ? 1 : ([theme isEqualToString:@"dark"] ? 2 : 0);
+		item.state = index == selected ? NSControlStateValueOn : NSControlStateValueOff;
+		[self applyMenuIcon:NppMenuSymbol(appearances[index]) toItem:item];
+		[view addItem:item];
+	}
+	[view addItem:[NSMenuItem separatorItem]];
 	[view addItem:[self item:@"Zoom In" action:@selector(zoomIn:) command:@"zoomIn"]];
 	[view addItem:[self item:@"Zoom Out" action:@selector(zoomOut:) command:@"zoomOut"]];
 	[view addItem:[self actionItem:@"Restore Default Zoom" action:@"zoomReset" command:@"zoomReset"]];
@@ -1912,6 +3076,21 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[view addItem:[self item:@"Compare Panes" action:@selector(comparePanes:) command:nil]];
 	[view addItem:[NSMenuItem separatorItem]];
 	[view addItem:[self item:@"Monitoring (tail -f)" action:@selector(toggleMonitoring:) command:nil]];
+	[view addItem:[NSMenuItem separatorItem]];
+	[view addItem:[self item:@"Outline" action:@selector(showOutline:) command:@"outline"]];
+	[view addItem:[self item:@"Folder Sidebar" action:@selector(toggleFolderSidebar:) command:nil]];
+	NSMenuItem *minimapItem = [self item:@"Minimap" action:@selector(toggleMinimap:) command:@"minimap"];
+	minimapItem.state = _settings.showMinimap ? NSControlStateValueOn : NSControlStateValueOff;
+	[view addItem:minimapItem];
+	NSMenuItem *previewItem = [self item:@"Preview" action:@selector(togglePreview:) command:@"preview"];
+	previewItem.state = _previewVisible ? NSControlStateValueOn : NSControlStateValueOff;
+	[view addItem:previewItem];
+	NSMenuItem *csvItem = [self item:@"CSV Table" action:@selector(toggleCsvTable:) command:nil];
+	NppOfficeRef *csvOffice = [self officeRefForDocument:[self currentDocument]];
+	csvItem.enabled = csvOffice.kind == NppOfficeKindCSV;
+	csvItem.state = csvOffice.kind == NppOfficeKindCSV && csvOffice.showTable ? NSControlStateValueOn : NSControlStateValueOff;
+	[view addItem:csvItem];
+	[view addItem:[self item:@"Clone Beside" action:@selector(cloneBeside:) command:@"clone"]];
 	[self addMenu:view title:@"View" to:bar];
 
 	NSMenu *encoding = [NSMenu new];
@@ -1922,6 +3101,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@(info->name) action:@selector(chooseEncoding:) keyEquivalent:@""];
 		item.target = self;
 		item.tag = info->id;
+		[self applyMenuIcon:@"textformat" toItem:item];
 		if (info->group[0] == '\0') {
 			[encoding addItem:item];
 			continue;
@@ -1932,36 +3112,53 @@ static void HostStatus(NppMacHost *host, const char *text) {
 			groups[@(info->group)] = group;
 			NSMenuItem *parent = [[NSMenuItem alloc] initWithTitle:@(info->group) action:nil keyEquivalent:@""];
 			parent.submenu = group;
+			[self applyMenuIcon:@"textformat" toItem:parent];
 			[characterSets addItem:parent];
 		}
 		[group addItem:item];
 	}
 	NSMenuItem *sets = [[NSMenuItem alloc] initWithTitle:@"Character sets" action:nil keyEquivalent:@""];
 	sets.submenu = characterSets;
+	[self applyMenuIcon:NppMenuSymbol(@"Character sets") toItem:sets];
 	[encoding addItem:sets];
 	[self addMenu:encoding title:@"Encoding" to:bar];
 
 	NSMenu *eol = [NSMenu new];
-	NSArray *eols = @[@"Windows (CRLF)", @"Classic Mac (CR)", @"Unix (LF)"];
+	NSArray *eols = @[NppL(@"Windows (CRLF)"), NppL(@"Classic Mac (CR)"), NppL(@"Unix (LF)")];
 	for (NSInteger index = 0; index < 3; index++) {
 		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:eols[index] action:@selector(chooseEOL:) keyEquivalent:@""];
 		item.target = self;
 		item.tag = index;
+		[self applyMenuIcon:@"return" toItem:item];
 		[eol addItem:item];
 	}
 	[self addMenu:eol title:@"Line Endings" to:bar];
 
 	NSMenu *language = [NSMenu new];
-	NSMenuItem *automatic = [[NSMenuItem alloc] initWithTitle:@"Automatic" action:@selector(chooseAutomaticLanguage:) keyEquivalent:@""];
+	NSMenuItem *automatic = [[NSMenuItem alloc] initWithTitle:NppL(@"Automatic") action:@selector(chooseAutomaticLanguage:) keyEquivalent:@""];
 	automatic.target = self;
+	[self applyMenuIcon:NppMenuSymbol(@"Automatic") toItem:automatic];
 	[language addItem:automatic];
 	[language addItem:[NSMenuItem separatorItem]];
 	for (LangInfo *info in _catalog.allLanguages) {
 		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:info.name action:@selector(chooseLanguage:) keyEquivalent:@""];
 		item.target = self;
 		item.representedObject = info.name;
+		[self applyMenuIcon:@"chevron.left.forwardslash.chevron.right" toItem:item];
 		[language addItem:item];
 	}
+	if (_userLanguages.languages.count) {
+		[language addItem:[NSMenuItem separatorItem]];
+		for (NppUserLanguage *user in _userLanguages.languages) {
+			NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:user.name action:@selector(chooseUserLanguage:) keyEquivalent:@""];
+			item.target = self;
+			item.representedObject = user.name;
+			[self applyMenuIcon:@"person.crop.rectangle" toItem:item];
+			[language addItem:item];
+		}
+	}
+	[language addItem:[NSMenuItem separatorItem]];
+	[language addItem:[self item:@"User Languages…" action:@selector(showUserLanguages:) command:nil]];
 	[self addMenu:language title:@"Language" to:bar];
 
 	NSMenu *macro = [NSMenu new];
@@ -1977,6 +3174,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 			NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:@selector(playSavedMacro:) keyEquivalent:@""];
 			item.target = self;
 			item.representedObject = name;
+			[self applyMenuIcon:@"play.circle" toItem:item];
 			[macro addItem:item];
 		}
 	}
@@ -1984,13 +3182,15 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 	NSMenu *plugins = [NSMenu new];
 	if (_plugins.count == 0 && _pluginErrors.count == 0) {
-		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:@"No plugins loaded" action:nil keyEquivalent:@""];
+		NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:NppL(@"No plugins loaded") action:nil keyEquivalent:@""];
 		none.enabled = NO;
+		[self applyMenuIcon:NppMenuSymbol(@"No plugins loaded") toItem:none];
 		[plugins addItem:none];
 	}
 	for (NSString *error in _pluginErrors) {
 		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:error action:nil keyEquivalent:@""];
 		item.enabled = NO;
+		[self applyMenuIcon:@"exclamationmark.triangle" toItem:item];
 		[plugins addItem:item];
 	}
 	for (NSDictionary *plugin in _plugins) {
@@ -2001,15 +3201,18 @@ static void HostStatus(NppMacHost *host, const char *text) {
 			NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@(commands[index].title ?: "Command") action:@selector(runPluginCommand:) keyEquivalent:@""];
 			item.target = self;
 			item.representedObject = @[plugin, @(index)];
+			[self applyMenuIcon:@"puzzlepiece" toItem:item];
 			[submenu addItem:item];
 		}
 		if (submenu.numberOfItems == 0) {
-			NSMenuItem *empty = [[NSMenuItem alloc] initWithTitle:@"No commands" action:nil keyEquivalent:@""];
+			NSMenuItem *empty = [[NSMenuItem alloc] initWithTitle:NppL(@"No commands") action:nil keyEquivalent:@""];
 			empty.enabled = NO;
+			[self applyMenuIcon:NppMenuSymbol(@"No commands") toItem:empty];
 			[submenu addItem:empty];
 		}
 		NSMenuItem *pluginItem = [[NSMenuItem alloc] initWithTitle:plugin[@"name"] ?: @"Plugin" action:nil keyEquivalent:@""];
 		pluginItem.submenu = submenu;
+		[self applyMenuIcon:@"puzzlepiece.extension" toItem:pluginItem];
 		[plugins addItem:pluginItem];
 	}
 	[plugins addItem:[NSMenuItem separatorItem]];
@@ -2027,6 +3230,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		item.target = self;
 		item.tag = windowIndex++;
 		item.state = document == [self currentDocument] ? NSControlStateValueOn : NSControlStateValueOff;
+		[self applyMenuIcon:@"doc.text" toItem:item];
 		[windowMenu addItem:item];
 	}
 	[self addMenu:windowMenu title:@"Window" to:bar];
@@ -2039,10 +3243,11 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (void)addMenu:(NSMenu *)menu title:(NSString *)title to:(NSMenu *)bar {
-	menu.title = title;
+	menu.title = NppL(title);
+	menu.identifier = title;
 	NSMenuItem *item = [NSMenuItem new];
 	item.submenu = menu;
-	item.title = title;
+	item.title = NppL(title);
 	[bar addItem:item];
 }
 
@@ -2063,13 +3268,27 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (void)applyWindowTheme {
+	NSAppearance *appearance = nil;
 	if ([_settings.theme isEqualToString:@"dark"]) {
-		_window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+		appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 	} else if ([_settings.theme isEqualToString:@"light"]) {
-		_window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
-	} else {
-		_window.appearance = nil;
+		appearance = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
 	}
+	NSApp.appearance = appearance;
+	_window.appearance = appearance;
+	_preferencesWindow.appearance = appearance;
+	_characterPanel.appearance = appearance;
+	[self layoutFolderSidebar];
+}
+
+- (void)systemAppearanceChanged {
+	if ([_settings.theme isEqualToString:@"dark"] || [_settings.theme isEqualToString:@"light"]) {
+		return;
+	}
+	for (DocumentTab *document in _documents) {
+		[document applySettings:_settings dark:[self darkAppearance]];
+	}
+	[self layoutFolderSidebar];
 }
 
 - (void)addDocument:(DocumentTab *)document {
@@ -2113,18 +3332,158 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return NSNotFound;
 }
 
+- (ScintillaView *)editorForDocument:(DocumentTab *)document inPane:(NSInteger)pane {
+	if (document == _cloneSource && pane == _clonePane) {
+		return [document mirrorView];
+	}
+	return document.editor;
+}
+
+- (ScintillaView *)activeEditor {
+	NSResponder *responder = _window.firstResponder;
+	while (responder) {
+		if ([responder isKindOfClass:[ScintillaView class]]) {
+			return (ScintillaView *)responder;
+		}
+		responder = responder.nextResponder;
+	}
+	return [self currentDocument].editor;
+}
+
+- (NSInteger)paneIndexContainingView:(NSView *)view {
+	while (view) {
+		if ([view isKindOfClass:[NppPaneTabBar class]]) {
+			return ((NppPaneTabBar *)view).paneIndex;
+		}
+		if ([view isKindOfClass:[NppPaneSlot class]]) {
+			return ((NppPaneSlot *)view).paneIndex;
+		}
+		view = view.superview;
+	}
+	return NSNotFound;
+}
+
+- (NppOfficeRef *)officeRefForDocument:(DocumentTab *)document {
+	return document ? [_office objectForKey:document] : nil;
+}
+
+- (BOOL)officeShowsSurface:(DocumentTab *)document {
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (!office.view) {
+		return NO;
+	}
+	if (office.kind == NppOfficeKindPDF || office.kind == NppOfficeKindDOC || office.kind == NppOfficeKindDOCX) {
+		return YES;
+	}
+	if (office.kind == NppOfficeKindXLSX) {
+		return office.showTable && office.view != nil;
+	}
+	return office.kind == NppOfficeKindCSV && office.showTable;
+}
+
+- (void)rememberOffice:(NppOfficeRef *)office forDocument:(DocumentTab *)document {
+	if (document && office) {
+		[_office setObject:office forKey:document];
+	}
+}
+
+- (void)lockOfficeText:(DocumentTab *)document {
+	[document.editor setEditable:NO];
+	[document.editor message:SCI_SETREADONLY wParam:1 lParam:0];
+}
+
+- (void)pushOfficeCsv:(NSString *)csv document:(DocumentTab *)document {
+	if (!document) {
+		return;
+	}
+	document.suppressMacro = YES;
+	[document.editor setString:csv ?: @""];
+	document.suppressMacro = NO;
+	document.dirty = YES;
+	[self refreshStatus];
+}
+
+- (NppCsvView *)csvViewForDocument:(DocumentTab *)document {
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	NppCsvView *view = [office.view isKindOfClass:[NppCsvView class]] ? (NppCsvView *)office.view : nil;
+	if (!view) {
+		view = [[NppCsvView alloc] initWithFrame:NSZeroRect];
+		__weak AppDelegate *weakSelf = self;
+		__weak DocumentTab *weakDocument = document;
+		view.onEdit = ^(NSString *csv) {
+			[weakSelf pushOfficeCsv:csv document:weakDocument];
+		};
+		view.onShowText = ^{
+			AppDelegate *strongSelf = weakSelf;
+			DocumentTab *strongDocument = weakDocument;
+			NppOfficeRef *current = [strongSelf officeRefForDocument:strongDocument];
+			current.showTable = NO;
+			NSInteger pane = [strongSelf paneIndexOfDocument:strongDocument];
+			if (pane != NSNotFound) {
+				[strongSelf placeEditor:strongDocument inPane:pane];
+				[strongSelf->_window makeFirstResponder:strongDocument.editor];
+			}
+			[strongSelf buildMenus];
+		};
+		office.view = view;
+	}
+	return view;
+}
+
 - (void)placeEditor:(DocumentTab *)document inPane:(NSInteger)pane {
 	NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
 	if (![slot isKindOfClass:[NppPaneSlot class]] || !document) {
 		return;
 	}
-	[document.editor removeFromSuperview];
 	[slot removeEditorViews];
-	document.editor.scrollView.focusRingType = NSFocusRingTypeNone;
-	document.editor.autoresizingMask = NSViewNotSizable;
-	document.editor.frame = slot.editorRect;
-	[slot addSubview:document.editor];
+	if ([self officeShowsSurface:document]) {
+		NSView *surface = [self officeRefForDocument:document].view;
+		[surface removeFromSuperview];
+		surface.autoresizingMask = NSViewNotSizable;
+		surface.frame = slot.editorRect;
+		[slot addSubview:surface];
+		[slot layoutContents];
+		return;
+	}
+	ScintillaView *view = [self editorForDocument:document inPane:pane];
+	[view removeFromSuperview];
+	view.scrollView.focusRingType = NSFocusRingTypeNone;
+	view.autoresizingMask = NSViewNotSizable;
+	view.clipsToBounds = YES;
+	view.frame = slot.editorRect;
+	[slot addSubview:view];
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (office.kind == NppOfficeKindCSV && !office.showTable) {
+		NSView *bar = [[NSView alloc] initWithFrame:NSZeroRect];
+		bar.identifier = @"npp.csv.bar";
+		bar.wantsLayer = YES;
+		bar.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+		NSImage *image = [NSImage imageWithSystemSymbolName:@"tablecells" accessibilityDescription:NppL(@"As Table")];
+		image.size = NSMakeSize(14, 14);
+		[image setTemplate:YES];
+		NSButton *button = [NSButton buttonWithTitle:NppL(@"As Table") image:image target:self action:@selector(toggleCsvTable:)];
+		button.bezelStyle = NSBezelStyleRounded;
+		button.imagePosition = NSImageLeading;
+		button.font = [NSFont systemFontOfSize:12];
+		button.tag = 1;
+		NSTextField *hint = [NSTextField labelWithString:NppL(@"This CSV is open as text.")];
+		hint.font = [NSFont systemFontOfSize:12];
+		hint.textColor = NSColor.secondaryLabelColor;
+		hint.lineBreakMode = NSLineBreakByTruncatingTail;
+		hint.tag = 2;
+		[bar addSubview:button];
+		[bar addSubview:hint];
+		[slot addSubview:bar];
+	}
+	if (NppOfficeKindIsViewOnly(office.kind)) {
+		[self lockOfficeText:document];
+	}
+	[self attachMinimapToSlot:slot forDocument:document];
+	if (_previewVisible && pane == _activePane) {
+		[self attachPreviewToSlot:slot];
+	}
 	[slot layoutContents];
+	[self refreshMinimapForDocument:document inPane:pane];
 }
 
 - (void)showDocument:(DocumentTab *)document inPane:(NSInteger)pane {
@@ -2154,7 +3513,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_activePane = existing;
 	[_tabs selectTabViewItem:[self itemForDocument:document]];
 	[_splitHost setActivePane:existing];
-	[_window makeFirstResponder:document.editor];
+	NSView *surface = [self officeShowsSurface:document] ? [self officeRefForDocument:document].view : document.editor;
+	[_window makeFirstResponder:surface];
 	[self rebuildTabStrip];
 	[self refreshStatus];
 }
@@ -2169,6 +3529,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:index];
 		slot.tabBar.dropIndex = -1;
 		[slot.tabBar setNeedsDisplay:YES];
+		[slot clearSplitPreview];
 	}
 }
 
@@ -2205,9 +3566,86 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self relayoutPaneEditors];
 }
 
+- (BOOL)canSplitDocument:(DocumentTab *)document besidePane:(NSInteger)pane onRight:(BOOL)onRight {
+	if (![document isKindOfClass:[DocumentTab class]] || _paneDocuments.count >= 6) {
+		return NO;
+	}
+	if (pane < 0 || pane >= (NSInteger)_paneDocuments.count) {
+		return NO;
+	}
+	NSInteger source = [self paneIndexOfDocument:document];
+	if (source == NSNotFound) {
+		return NO;
+	}
+	BOOL alone = [self tabsForPane:source].count <= 1;
+	if (alone && source == pane) {
+		return NO;
+	}
+	if (alone && onRight && source == pane + 1) {
+		return NO;
+	}
+	if (alone && !onRight && source == pane - 1) {
+		return NO;
+	}
+	return YES;
+}
+
+- (BOOL)splitDocument:(DocumentTab *)document besidePane:(NSInteger)pane onRight:(BOOL)onRight {
+	if (![self canSplitDocument:document besidePane:pane onRight:onRight]) {
+		return NO;
+	}
+	NSInteger insert = onRight ? pane + 1 : pane;
+	NSMutableArray<NSNumber *> *fractions = [[_splitHost fractions] mutableCopy];
+	if (fractions.count != _paneDocuments.count) {
+		fractions = [NSMutableArray array];
+		CGFloat share = 1.0 / _paneDocuments.count;
+		for (NSInteger index = 0; index < (NSInteger)_paneDocuments.count; index++) {
+			[fractions addObject:@(share)];
+		}
+	}
+	CGFloat half = fractions[pane].doubleValue / 2.0;
+	fractions[pane] = @(half);
+	[fractions insertObject:@(half) atIndex:insert];
+	[_paneDocuments insertObject:[NSNull null] atIndex:insert];
+	[_paneTabs insertObject:[NSMutableArray array] atIndex:insert];
+	[_splitHost setPaneCount:_paneDocuments.count];
+	[_splitHost setFractions:fractions];
+	[self moveDocument:document toPane:insert atIndex:0];
+	return YES;
+}
+
+- (void)splitTabLeft:(id)sender {
+	(void)sender;
+	DocumentTab *document = [self currentDocument];
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (pane != NSNotFound) {
+		[self splitDocument:document besidePane:pane onRight:NO];
+	}
+}
+
+- (void)splitTabRight:(id)sender {
+	(void)sender;
+	DocumentTab *document = [self currentDocument];
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (pane != NSNotFound) {
+		[self splitDocument:document besidePane:pane onRight:YES];
+	}
+}
+
 - (void)moveDocument:(DocumentTab *)document toPane:(NSInteger)pane atIndex:(NSInteger)index {
 	if (![document isKindOfClass:[DocumentTab class]] || pane < 0 || pane >= (NSInteger)_paneDocuments.count) {
 		return;
+	}
+	if (document == _cloneSource) {
+		NSInteger clonePane = _clonePane;
+		NSInteger before = (NSInteger)_paneDocuments.count;
+		[self dropClone];
+		if ((NSInteger)_paneDocuments.count < before && clonePane < pane) {
+			pane--;
+		}
+		if (pane < 0 || pane >= (NSInteger)_paneDocuments.count) {
+			return;
+		}
 	}
 	NSInteger source = [self paneIndexOfDocument:document];
 	if (source == NSNotFound) {
@@ -2271,7 +3709,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	id document = _paneDocuments[pane];
 	if ([document isKindOfClass:[DocumentTab class]]) {
 		[_tabs selectTabViewItem:[self itemForDocument:document]];
-		[_window makeFirstResponder:((DocumentTab *)document).editor];
+		ScintillaView *editor = document == _cloneSource && pane == _clonePane ? [document existingMirror] : ((DocumentTab *)document).editor;
+		[_window makeFirstResponder:editor ?: ((DocumentTab *)document).editor];
 	}
 	[self rebuildTabStrip];
 	[self refreshStatus];
@@ -2437,7 +3876,142 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return opened;
 }
 
+- (BOOL)openRichDocumentAtPath:(NSString *)path kind:(NppOfficeKind)kind {
+	NSString *error = nil;
+	NSString *text = @"";
+	NSView *surface = nil;
+	if (kind == NppOfficeKindPDF) {
+		surface = NppPDFViewForPath(path, &error);
+		if (!surface) {
+			[self alert:error ?: @"Could not open this PDF."];
+			return NO;
+		}
+	} else {
+		NppWordView *word = [[NppWordView alloc] initWithFrame:NSZeroRect];
+		if (![word loadPath:path kind:kind error:&error]) {
+			[self alert:error ?: @"Could not read this Word file."];
+			return NO;
+		}
+		surface = word;
+		text = word.plainText ?: @"";
+	}
+	DocumentTab *document = [[DocumentTab alloc] initWithFrame:_tabs.bounds];
+	document.path = path;
+	document.displayName = path.lastPathComponent;
+	document.encoding = kEncodingUTF8;
+	document.manualLanguage = YES;
+	document.language = kind == NppOfficeKindPDF ? @"PDF" : @"Word";
+	NppOfficeRef *office = [NppOfficeRef new];
+	office.kind = kind;
+	office.view = surface;
+	[self rememberOffice:office forDocument:document];
+	[document setUtf8Text:text ?: @""];
+	[document markClean];
+	[self addDocument:document];
+	if (kind != NppOfficeKindPDF) {
+		[self lockOfficeText:document];
+	}
+	[self rememberPath:path];
+	[self noteDiskRevisionForDocument:document];
+	return YES;
+}
+
+- (void)installXlsx:(NSArray<NSArray<NSString *> *> *)rows sheets:(NSArray<NSString *> *)sheets sheet:(NSString *)sheet truncated:(BOOL)truncated document:(DocumentTab *)document {
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (!office) {
+		office = [NppOfficeRef new];
+		[self rememberOffice:office forDocument:document];
+	}
+	office.kind = NppOfficeKindXLSX;
+	office.showTable = YES;
+	NppCsvView *table = [self csvViewForDocument:document];
+	__weak AppDelegate *weakSelf = self;
+	__weak DocumentTab *weakDocument = document;
+	table.onSheet = ^(NSString *name) {
+		[weakSelf reloadXlsxDocument:weakDocument sheet:name];
+	};
+	[table loadRows:rows editable:NO sheets:sheets selectedSheet:sheet truncated:truncated];
+	document.manualLanguage = YES;
+	document.language = @"Excel";
+	[self lockOfficeText:document];
+}
+
+- (BOOL)reloadXlsxDocument:(DocumentTab *)document sheet:(NSString *)sheet {
+	if (!document.path.length) {
+		return NO;
+	}
+	NSString *error = nil;
+	NSArray<NSString *> *sheets = nil;
+	NSArray<NSArray<NSString *> *> *rows = nil;
+	BOOL truncated = NO;
+	if (!NppXlsxLoad(document.path, sheet, &sheets, &rows, &truncated, &error)) {
+		[self alert:error ?: @"Could not open this Excel file."];
+		return NO;
+	}
+	NSString *selected = sheet.length ? sheet : sheets.firstObject;
+	[self installXlsx:rows sheets:sheets sheet:selected truncated:truncated document:document];
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (pane != NSNotFound) {
+		[self placeEditor:document inPane:pane];
+		[_window makeFirstResponder:[self officeRefForDocument:document].view];
+	}
+	[self noteDiskRevisionForDocument:document];
+	[self refreshStatus];
+	return YES;
+}
+
+- (BOOL)openSpreadsheetAtPath:(NSString *)path {
+	NSString *error = nil;
+	NSArray<NSString *> *sheets = nil;
+	NSArray<NSArray<NSString *> *> *rows = nil;
+	BOOL truncated = NO;
+	if (!NppXlsxLoad(path, nil, &sheets, &rows, &truncated, &error)) {
+		[self alert:error ?: @"Could not open this Excel file."];
+		return NO;
+	}
+	DocumentTab *document = [[DocumentTab alloc] initWithFrame:_tabs.bounds];
+	document.path = path;
+	document.displayName = path.lastPathComponent;
+	document.encoding = kEncodingUTF8;
+	[self addDocument:document];
+	[document setUtf8Text:@""];
+	[document markClean];
+	[self installXlsx:rows sheets:sheets sheet:sheets.firstObject truncated:truncated document:document];
+	[self rememberPath:path];
+	[self noteDiskRevisionForDocument:document];
+	[self placeEditor:document inPane:[self paneIndexOfDocument:document]];
+	[_window makeFirstResponder:[self officeRefForDocument:document].view];
+	[self refreshStatus];
+	return YES;
+}
+
+- (void)attachCsvDocument:(DocumentTab *)document {
+	if (!document || NppOfficeKindForPath(document.path) != NppOfficeKindCSV) {
+		return;
+	}
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (!office) {
+		office = [NppOfficeRef new];
+		office.kind = NppOfficeKindCSV;
+		office.showTable = YES;
+		[self rememberOffice:office forDocument:document];
+	}
+	NppCsvView *table = [self csvViewForDocument:document];
+	[table loadCsv:[document utf8Text] ?: @""];
+	if (!table.fitsInTable) {
+		office.showTable = NO;
+		[self setStatusText:@"This CSV is too large for the table."];
+	}
+}
+
 - (BOOL)openPath:(NSString *)path {
+	NppOfficeKind kind = NppOfficeKindForPath(path);
+	if (kind == NppOfficeKindPDF || kind == NppOfficeKindDOC || kind == NppOfficeKindDOCX) {
+		return [self openRichDocumentAtPath:path kind:kind];
+	}
+	if (kind == NppOfficeKindXLSX) {
+		return [self openSpreadsheetAtPath:path];
+	}
 	NSData *data = [NSData dataWithContentsOfFile:path];
 	if (!data) {
 		return NO;
@@ -2451,13 +4025,18 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSString *text = [[NSString alloc] initWithBytes:decoded.utf8.data() length:decoded.utf8.size() encoding:NSUTF8StringEncoding] ?: @"";
 	[self addDocument:document];
 	[document setUtf8Text:text];
-	LangInfo *info = [_catalog languageForPath:path sample:text];
+	NppUserLanguage *user = [_userLanguages languageForPath:path];
+	LangInfo *info = user ? [user langInfo] : [_catalog languageForPath:path sample:text];
 	[document applyLanguage:info dark:[self darkAppearance]];
 	[document markClean];
 	[self rememberPath:path];
 	[self noteDiskRevisionForDocument:document];
 	BOOL writable = [[NSFileManager defaultManager] isWritableFileAtPath:path];
 	[document.editor setEditable:writable];
+	if (kind == NppOfficeKindCSV) {
+		[self attachCsvDocument:document];
+		[self placeEditor:document inPane:[self paneIndexOfDocument:document]];
+	}
 	return YES;
 }
 
@@ -2506,6 +4085,17 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (BOOL)saveDocument:(DocumentTab *)document toPath:(NSString *)path error:(NSString **)error {
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (NppOfficeKindIsViewOnly(office.kind)) {
+		if (error) {
+			*error = @"This file is only open for reading.";
+		}
+		return NO;
+	}
+	if (office.kind == NppOfficeKindCSV && office.showTable && [office.view isKindOfClass:[NppCsvView class]]) {
+		[self pushOfficeCsv:[(NppCsvView *)office.view csvText] document:document];
+		document.dirty = YES;
+	}
 	[document.editor message:SCI_CONVERTEOLS wParam:(uptr_t)document.eolMode lParam:0];
 	NSString *text = [document utf8Text];
 	const char *utf8Bytes = text.UTF8String ?: "";
@@ -2519,6 +4109,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		return NO;
 	}
 	NSData *data = [NSData dataWithBytes:encoded.data() length:encoded.size()];
+	[self backupFileIfNeeded:path];
 	NSError *writeError = nil;
 	if (![data writeToFile:path options:NSDataWritingAtomic error:&writeError]) {
 		if (error) {
@@ -2548,6 +4139,10 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		[self saveDocumentAs:sender];
 		return;
 	}
+	if (NppOfficeKindIsViewOnly([self officeRefForDocument:document].kind)) {
+		[self alert:@"This file is only open for reading."];
+		return;
+	}
 	NSString *error = nil;
 	if (![self saveDocument:document toPath:document.path error:&error]) {
 		[self alert:error ?: @"Save failed."];
@@ -2569,6 +4164,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		}
 		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@(info->name) action:nil keyEquivalent:@""];
 		item.tag = info->id;
+		[self applyMenuIcon:@"textformat" toItem:item];
 		[menu addItem:item];
 	}
 	return menu;
@@ -2659,6 +4255,10 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)sender;
 	DocumentTab *document = [self currentDocument];
 	if (!document) {
+		return;
+	}
+	if (NppOfficeKindIsViewOnly([self officeRefForDocument:document].kind)) {
+		[self alert:@"This file is only open for reading."];
 		return;
 	}
 	NSSavePanel *panel = [NSSavePanel savePanel];
@@ -2760,6 +4360,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (!document) {
 		return;
 	}
+	if (document == _cloneSource) {
+		[self dropClone];
+	}
 	if (![self confirmClosingDocuments:@[document] grouped:YES]) {
 		_discardUnsavedSession = NO;
 		return;
@@ -2787,7 +4390,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		}
 	}
 	if (_documents.count == 0) {
-		[self newDocument:nil];
+		if (!_suppressEmptyDocument) {
+			[self newDocument:nil];
+		}
 		return;
 	}
 	if (pane != NSNotFound && _paneDocuments.count > 1) {
@@ -2823,7 +4428,16 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (void)closeAllDocuments:(id)sender {
-	NSArray<DocumentTab *> *documents = [_documents copy];
+	NSMutableArray<DocumentTab *> *documents = [NSMutableArray array];
+	for (DocumentTab *document in _documents) {
+		if (!document.pinned) {
+			[documents addObject:document];
+		}
+	}
+	if (documents.count == 0) {
+		[self setStatusText:@"Pinned tabs stay open."];
+		return;
+	}
 	if (![self confirmClosingDocuments:documents grouped:YES]) {
 		_discardUnsavedSession = NO;
 		return;
@@ -2844,7 +4458,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	DocumentTab *keep = [self currentDocument];
 	NSMutableArray<DocumentTab *> *closing = [NSMutableArray array];
 	for (DocumentTab *document in _documents) {
-		if (document != keep) {
+		if (document != keep && !document.pinned) {
 			[closing addObject:document];
 		}
 	}
@@ -2981,7 +4595,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)alert:(NSString *)message {
 	NSAlert *alert = [NSAlert new];
-	alert.messageText = message;
+	alert.messageText = NppL(message);
 	[alert runModal];
 }
 
@@ -2992,6 +4606,25 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	flags.regex = _regex.state == NSControlStateValueOn;
 	flags.dotMatchesNewline = _dotAll.state == NSControlStateValueOn;
 	return flags;
+}
+
+- (void)hideFind:(id)sender {
+	(void)sender;
+	_workspace.findVisible = NO;
+	[_workspace layoutPanes];
+	DocumentTab *document = [self currentDocument];
+	if (document.editor) {
+		[_window makeFirstResponder:document.editor];
+	}
+}
+
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)command {
+	(void)textView;
+	if (command == @selector(cancelOperation:) && (control == _findField || control == _replaceField)) {
+		[self hideFind:nil];
+		return YES;
+	}
+	return NO;
 }
 
 - (void)showFind:(id)sender {
@@ -3042,6 +4675,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)hideFindInFiles:(id)sender {
 	(void)sender;
+	[self cancelFindInFiles:nil];
 	_workspace.resultsVisible = NO;
 	[_workspace layoutPanes];
 }
@@ -3069,6 +4703,35 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return flags;
 }
 
+- (void)setFindSearchActive:(BOOL)active {
+	_findCancel.hidden = !active;
+	NSButton *replaceFiles = (NSButton *)[self chromeTagged:26 in:_resultsPanel];
+	replaceFiles.enabled = !active;
+	if (active) {
+		[_findProgress startAnimation:nil];
+	} else {
+		[_findProgress stopAnimation:nil];
+	}
+	[self layoutResultsPanel];
+}
+
+- (NSString *)findProgressTextForPath:(NSString *)path scanned:(NSInteger)scanned hits:(NSInteger)hits finished:(BOOL)finished cancelled:(BOOL)cancelled limited:(BOOL)limited {
+	if (!finished) {
+		return [NSString stringWithFormat:@"%@ · %@ · %ld %@ · %ld %@", NppL(@"Searching"), path.length ? path : @"…", (long)scanned, NppL(@"files"), (long)hits, NppL(@"hits")];
+	}
+	NSString *lead = cancelled ? NppL(@"Stopped") : NppL(@"Finished");
+	NSString *text = [NSString stringWithFormat:@"%@ · %ld %@ · %ld %@", lead, (long)hits, NppL(@"hits"), (long)scanned, NppL(@"files")];
+	if (limited && !cancelled) {
+		text = [text stringByAppendingFormat:@" · %@", NppL(@"Result limit reached")];
+	}
+	return text;
+}
+
+- (void)cancelFindInFiles:(id)sender {
+	(void)sender;
+	[_findToken cancel];
+}
+
 - (void)runFindInFiles:(id)sender {
 	(void)sender;
 	NSString *query = _filesQuery.stringValue;
@@ -3079,12 +4742,38 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		[self alert:@"Enter the text to find and a folder that exists."];
 		return;
 	}
-	NSArray<NppFindHit *> *hits = NppFindInFiles(directory, query, _filesFilters.stringValue, _filesSubfolders.state == NSControlStateValueOn, [self fileSearchFlags], 1000);
+	[_findToken cancel];
 	[_hits removeAllObjects];
-	[_hits addObjectsFromArray:hits];
 	[_resultsTable reloadData];
-	[self sizeResultColumns];
-	[self setStatusText:[NSString stringWithFormat:@"Find in Files: %lu hit(s) in %@.", (unsigned long)hits.count, directory]];
+	[self setFindSearchActive:YES];
+	NSString *filters = _filesFilters.stringValue;
+	BOOL subfolders = _filesSubfolders.state == NSControlStateValueOn;
+	SearchFlags flags = [self fileSearchFlags];
+	__weak AppDelegate *weakSelf = self;
+	__block NppFindScanToken *token = nil;
+	token = NppStartFindInFiles(directory, query, filters, subfolders, flags, 1000, ^(NppFindScan *scan) {
+		AppDelegate *strongSelf = weakSelf;
+		if (!strongSelf || !scan || strongSelf->_findToken != token) {
+			return;
+		}
+		if (scan.hits.count) {
+			[strongSelf->_hits addObjectsFromArray:scan.hits];
+			[strongSelf->_resultsTable reloadData];
+		}
+		NSString *progress = [strongSelf findProgressTextForPath:scan.path scanned:scan.scanned hits:strongSelf->_hits.count finished:scan.finished cancelled:scan.cancelled limited:scan.limited];
+		strongSelf->_findProgressLabel.stringValue = progress;
+		[strongSelf setStatusText:progress];
+		if (!scan.finished) {
+			return;
+		}
+		if (scan.error.length) {
+			[strongSelf alert:scan.error];
+		}
+		[strongSelf sizeResultColumns];
+		[strongSelf setFindSearchActive:NO];
+		strongSelf->_findToken = nil;
+	});
+	_findToken = token;
 }
 
 - (DocumentTab *)documentForPath:(NSString *)path {
@@ -3245,6 +4934,21 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (tableView == _quickOpenTable) {
 		return (NSInteger)_quickOpenRows.count;
 	}
+	if (tableView == _outlineTable) {
+		return (NSInteger)_outlineRows.count;
+	}
+	if (tableView == _shortcutTable) {
+		return (NSInteger)_shortcutRows.count;
+	}
+	if (tableView == _clipboardTable) {
+		return (NSInteger)_clips.items.count;
+	}
+	if (tableView == _snippetTable) {
+		return (NSInteger)_snippets.snippets.count;
+	}
+	if (tableView == _languageTable) {
+		return (NSInteger)_userLanguages.languages.count;
+	}
 	if (tableView == _folderOutline) {
 		return 0;
 	}
@@ -3252,6 +4956,43 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+	if (tableView == _outlineTable) {
+		if (row < 0 || row >= (NSInteger)_outlineRows.count) {
+			return @"";
+		}
+		NppSymbol *symbol = _outlineRows[row];
+		return [column.identifier isEqualToString:@"line"] ? [NSString stringWithFormat:@"%ld", (long)symbol.line] : symbol.name;
+	}
+	if (tableView == _shortcutTable) {
+		if (row < 0 || row >= (NSInteger)_shortcutRows.count) {
+			return @"";
+		}
+		return _shortcutRows[row][column.identifier] ?: @"";
+	}
+	if (tableView == _clipboardTable) {
+		if (row < 0 || row >= (NSInteger)_clips.items.count) {
+			return @"";
+		}
+		NSString *text = _clips.items[row];
+		NSString *line = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]].firstObject ?: text;
+		return line.length > 80 ? [[line substringToIndex:80] stringByAppendingString:@"…"] : line;
+	}
+	if (tableView == _snippetTable) {
+		if (row < 0 || row >= (NSInteger)_snippets.snippets.count) {
+			return @"";
+		}
+		return _snippets.snippets[row][column.identifier] ?: @"";
+	}
+	if (tableView == _languageTable) {
+		if (row < 0 || row >= (NSInteger)_userLanguages.languages.count) {
+			return @"";
+		}
+		NppUserLanguage *language = _userLanguages.languages[row];
+		if ([column.identifier isEqualToString:@"extensions"]) return language.extensions;
+		if ([column.identifier isEqualToString:@"keywords"]) return language.keywords;
+		if ([column.identifier isEqualToString:@"lexer"]) return language.lexer;
+		return language.name;
+	}
 	if (tableView == _quickOpenTable) {
 		if (row < 0 || row >= (NSInteger)_quickOpenRows.count) {
 			return @"";
@@ -3280,6 +5021,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)cell;
 	(void)rect;
 	(void)mouseLocation;
+	if (tableView != _resultsTable) {
+		return @"";
+	}
 	if ([tableColumn.identifier isEqualToString:@"close"]) {
 		return @"Close";
 	}
@@ -3292,12 +5036,17 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)sizeResultColumns {
 	NSTableColumn *pathColumn = [_resultsTable tableColumnWithIdentifier:@"file"];
+	NSTableColumn *textColumn = [_resultsTable tableColumnWithIdentifier:@"text"];
 	NSDictionary *attributes = @{NSFontAttributeName: [NSFont systemFontOfSize:[NSFont systemFontSize]]};
-	CGFloat width = 160;
+	CGFloat pathWidth = 160;
+	CGFloat textWidth = 160;
 	for (NppFindHit *hit in _hits) {
-		width = MAX(width, ceil([hit.path sizeWithAttributes:attributes].width) + 28);
+		pathWidth = MAX(pathWidth, ceil([(hit.path ?: @"") sizeWithAttributes:attributes].width) + 28);
+		textWidth = MAX(textWidth, ceil([(hit.lineText ?: @"") sizeWithAttributes:attributes].width) + 28);
 	}
-	pathColumn.width = width;
+	pathColumn.width = MIN(pathWidth, 4000);
+	textColumn.width = MIN(textWidth, 4000);
+	[_resultsScroll reflectScrolledClipView:_resultsScroll.contentView];
 }
 
 - (void)reloadFromDisk:(id)sender {
@@ -3307,7 +5056,45 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		[self alert:@"This document has not been saved."];
 		return;
 	}
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (office.kind == NppOfficeKindPDF) {
+		NSString *error = nil;
+		if (!NppReloadPDFView(office.view, document.path, &error)) {
+			[self alert:error ?: @"Could not open this PDF."];
+		}
+		[self noteDiskRevisionForDocument:document];
+		return;
+	}
+	if (office.kind == NppOfficeKindXLSX) {
+		[self reloadXlsxDocument:document sheet:[(NppCsvView *)office.view selectedSheet]];
+		return;
+	}
+	if (office.kind == NppOfficeKindDOC || office.kind == NppOfficeKindDOCX) {
+		NppWordView *word = [office.view isKindOfClass:[NppWordView class]] ? (NppWordView *)office.view : nil;
+		if (!word) {
+			word = [[NppWordView alloc] initWithFrame:NSZeroRect];
+			office.view = word;
+		}
+		NSString *error = nil;
+		if (![word loadPath:document.path kind:office.kind error:&error]) {
+			[self alert:error ?: @"Could not read this Word file."];
+			return;
+		}
+		[document.editor setEditable:YES];
+		[document.editor message:SCI_SETREADONLY wParam:0 lParam:0];
+		[document setUtf8Text:word.plainText ?: @""];
+		[self lockOfficeText:document];
+		NSInteger pane = [self paneIndexOfDocument:document];
+		if (pane != NSNotFound) {
+			[self placeEditor:document inPane:pane];
+		}
+		[self noteDiskRevisionForDocument:document];
+		return;
+	}
 	[document reloadFromDiskScrollingToEnd:NO];
+	if (office.kind == NppOfficeKindCSV && office.showTable) {
+		[(NppCsvView *)office.view loadCsv:[document utf8Text] ?: @""];
+	}
 	[self noteDiskRevisionForDocument:document];
 }
 
@@ -3360,6 +5147,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self item:@"Find…" action:@selector(showFind:) command:@"find"]];
 	[menu addItem:[self item:@"Replace…" action:@selector(showReplace:) command:@"replace"]];
+	[menu addItem:[self item:@"Reveal in Finder" action:@selector(revealInFinder:) command:nil]];
 	[menu addItem:[self actionItem:@"Toggle Bookmark" action:@"bookmark"]];
 	[menu addItem:[self item:@"Monitoring (tail -f)" action:@selector(toggleMonitoring:) command:nil]];
 	if (_plugins.count) {
@@ -3371,6 +5159,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 				NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@(commands[index].title ?: "Command") action:@selector(runPluginCommand:) keyEquivalent:@""];
 				item.target = self;
 				item.representedObject = @[plugin, @(index)];
+				[self applyMenuIcon:@"puzzlepiece" toItem:item];
 				[menu addItem:item];
 			}
 		}
@@ -3384,6 +5173,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	DisableKeyEquivalentSearch(menu);
 	[menu addItem:[self item:@"Close" action:@selector(closeDocument:) command:@"close"]];
 	[menu addItem:[self item:@"Close All but This" action:@selector(closeOtherDocuments:) command:nil]];
+	[menu addItem:[self item:document.pinned ? @"Unpin Tab" : @"Pin Tab" action:@selector(togglePin:) command:@"pin"]];
+	[menu addItem:[self item:@"Clone Beside" action:@selector(cloneBeside:) command:@"clone"]];
 	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self item:@"Save" action:@selector(saveDocument:) command:@"save"]];
 	[menu addItem:[self item:@"Reload from Disk" action:@selector(reloadFromDisk:) command:nil]];
@@ -3391,8 +5182,19 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	tail.state = document.fileMonitoring ? NSControlStateValueOn : NSControlStateValueOff;
 	[menu addItem:tail];
 	[menu addItem:[NSMenuItem separatorItem]];
+	NSInteger tabPane = [self paneIndexOfDocument:document];
+	NSMenuItem *splitLeft = [self item:@"Split Left" action:@selector(splitTabLeft:) command:nil];
+	NSMenuItem *splitRight = [self item:@"Split Right" action:@selector(splitTabRight:) command:nil];
+	splitLeft.enabled = [self canSplitDocument:document besidePane:tabPane onRight:NO];
+	splitRight.enabled = [self canSplitDocument:document besidePane:tabPane onRight:YES];
+	[menu addItem:splitLeft];
+	[menu addItem:splitRight];
+	[menu addItem:[NSMenuItem separatorItem]];
 	[menu addItem:[self item:@"Copy Full File Path" action:@selector(copyFullPath:) command:nil]];
 	[menu addItem:[self item:@"Copy Filename" action:@selector(copyFilename:) command:nil]];
+	NSMenuItem *reveal = [self item:@"Reveal in Finder" action:@selector(revealInFinder:) command:nil];
+	reveal.enabled = document.path.length > 0;
+	[menu addItem:reveal];
 	[menu addItem:[self item:@"Print…" action:@selector(printDocument:) command:nil]];
 	[menu addItem:[self actionItem:@"Read-Only" action:@"readonly"]];
 	return menu;
@@ -3405,7 +5207,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)deleteSelection:(id)sender {
 	(void)sender;
-	[[self currentDocument].editor message:SCI_CLEAR];
+	[[self activeEditor] message:SCI_CLEAR];
 }
 
 - (void)goToLine:(id)sender {
@@ -3468,38 +5270,186 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)sender;
 	_workspace.findVisible = YES;
 	[_workspace layoutPanes];
-	long found = NppFind([self currentDocument].editor, _findField.stringValue, true, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	long found = NppFind([self activeEditor], _findField.stringValue, true, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	[self noteSearch:_findField.stringValue inEditor:[self activeEditor]];
 	[self setStatusText:found < 0 ? @"No match." : @"Match found."];
 }
 
 - (void)findPrevious:(id)sender {
 	(void)sender;
-	long found = NppFind([self currentDocument].editor, _findField.stringValue, false, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	long found = NppFind([self activeEditor], _findField.stringValue, false, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	[self noteSearch:_findField.stringValue inEditor:[self activeEditor]];
 	[self setStatusText:found < 0 ? @"No match." : @"Match found."];
 }
 
 - (void)replaceNext:(id)sender {
 	(void)sender;
-	long found = NppReplace([self currentDocument].editor, _findField.stringValue, _replaceField.stringValue, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	long found = NppReplace([self activeEditor], _findField.stringValue, _replaceField.stringValue, _wrap.state == NSControlStateValueOn, [self searchFlags]);
 	[self setStatusText:found < 0 ? @"No match." : @"Replaced."];
 }
 
 - (void)replaceAll:(id)sender {
 	(void)sender;
-	long count = NppReplaceAll([self currentDocument].editor, _findField.stringValue, _replaceField.stringValue, [self searchFlags]);
+	long count = NppReplaceAll([self activeEditor], _findField.stringValue, _replaceField.stringValue, [self searchFlags]);
 	[self setStatusText:[NSString stringWithFormat:@"Replaced %ld.", count]];
 }
 
-- (void)undo:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_UNDO]; }
-- (void)redo:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_REDO]; }
-- (void)cut:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_CUT]; }
-- (void)copy:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_COPY]; }
-- (void)paste:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_PASTE]; }
-- (void)selectAll:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_SELECTALL]; }
-- (void)zoomIn:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_ZOOMIN]; }
-- (void)zoomOut:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_ZOOMOUT]; }
-- (void)foldAll:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_FOLDALL wParam:SC_FOLDACTION_CONTRACT lParam:0]; }
-- (void)unfoldAll:(id)sender { (void)sender; [[self currentDocument].editor message:SCI_FOLDALL wParam:SC_FOLDACTION_EXPAND lParam:0]; }
+- (void)rememberClipboardText {
+	NSString *text = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+	[_clips remember:text];
+	if (_clipboardTable) {
+		[_clipboardTable reloadData];
+	}
+}
+- (void)undo:(id)sender { (void)sender; [[self activeEditor] message:SCI_UNDO]; }
+- (void)redo:(id)sender { (void)sender; [[self activeEditor] message:SCI_REDO]; }
+- (void)cut:(id)sender { (void)sender; [[self activeEditor] message:SCI_CUT]; [self rememberClipboardText]; }
+- (void)copy:(id)sender {
+	(void)sender;
+	NSView *surface = [self officeShowsSurface:[self currentDocument]] ? [self officeRefForDocument:[self currentDocument]].view : nil;
+	if (surface && [self officeRefForDocument:[self currentDocument]].kind == NppOfficeKindPDF) {
+		[NSApp sendAction:@selector(copy:) to:surface from:sender];
+		return;
+	}
+	id responder = _window.firstResponder;
+	if ([responder isKindOfClass:[NSText class]]) {
+		[responder copy:sender];
+		[self rememberClipboardText];
+		return;
+	}
+	[[self activeEditor] message:SCI_COPY];
+	[self rememberClipboardText];
+}
+- (void)paste:(id)sender { (void)sender; [[self activeEditor] message:SCI_PASTE]; }
+- (void)selectAll:(id)sender {
+	(void)sender;
+	NSView *surface = [self officeShowsSurface:[self currentDocument]] ? [self officeRefForDocument:[self currentDocument]].view : nil;
+	if (surface && [self officeRefForDocument:[self currentDocument]].kind == NppOfficeKindPDF) {
+		[NSApp sendAction:@selector(selectAll:) to:surface from:sender];
+		return;
+	}
+	id responder = _window.firstResponder;
+	if ([responder isKindOfClass:[NSText class]]) {
+		[responder selectAll:sender];
+		return;
+	}
+	[[self activeEditor] message:SCI_SELECTALL];
+}
+- (id)zoomTargetUnderHit:(NSView *)hit {
+	for (NSView *view = hit; view; view = view.superview) {
+		if ([view isKindOfClass:[PDFView class]] || [view isKindOfClass:[NppWordView class]] || [view isKindOfClass:[NppCsvView class]] || [view isKindOfClass:[WKWebView class]] || [view isKindOfClass:[ScintillaView class]]) {
+			return view;
+		}
+	}
+	DocumentTab *document = [self currentDocument];
+	if ([self officeShowsSurface:document]) {
+		NSView *surface = [self officeRefForDocument:document].view;
+		if (surface) {
+			return surface;
+		}
+	}
+	return [self activeEditor];
+}
+
+- (NSInteger)nudgeVisibleZoom:(NSInteger)direction target:(id)target {
+	if (!target) {
+		return 100;
+	}
+	NSInteger percent = 100;
+	if ([target isKindOfClass:[ScintillaView class]]) {
+		ScintillaView *editor = target;
+		if (direction > 0) {
+			[editor message:SCI_ZOOMIN];
+		} else if (direction < 0) {
+			[editor message:SCI_ZOOMOUT];
+		} else {
+			[editor message:SCI_SETZOOM wParam:0 lParam:0];
+		}
+		int base = MAX(6, _settings.fontSize);
+		long zoom = [editor message:SCI_GETZOOM];
+		percent = (NSInteger)llround(100.0 * (base + zoom) / (double)base);
+	} else if ([target isKindOfClass:[PDFView class]]) {
+		PDFView *pdf = target;
+		if (direction == 0) {
+			pdf.autoScales = YES;
+		} else {
+			CGFloat current = pdf.scaleFactor;
+			if (current < 0.05) {
+				current = 1;
+			}
+			pdf.autoScales = NO;
+			CGFloat next = current * (direction > 0 ? 1.15 : (1.0 / 1.15));
+			CGFloat minScale = pdf.minScaleFactor < 0.05 ? 0.15 : pdf.minScaleFactor;
+			CGFloat maxScale = pdf.maxScaleFactor < 1 ? 6 : pdf.maxScaleFactor;
+			pdf.scaleFactor = MIN(maxScale, MAX(minScale, next));
+		}
+		percent = (NSInteger)llround(MAX(pdf.scaleFactor, 0.01) * 100.0);
+	} else if ([target isKindOfClass:[NppWordView class]]) {
+		percent = [(NppWordView *)target adjustZoom:direction];
+	} else if ([target isKindOfClass:[NppCsvView class]]) {
+		percent = [(NppCsvView *)target adjustZoom:direction];
+	} else if ([target isKindOfClass:[WKWebView class]]) {
+		WKWebView *web = target;
+		web.allowsMagnification = YES;
+		if (direction == 0) {
+			web.magnification = 1;
+		} else {
+			CGFloat next = web.magnification * (direction > 0 ? 1.15 : (1.0 / 1.15));
+			web.magnification = MIN(4, MAX(0.4, next));
+		}
+		percent = (NSInteger)llround(web.magnification * 100.0);
+	}
+	[self setStatusText:[NSString stringWithFormat:@"Zoom %ld%%", (long)percent]];
+	return percent;
+}
+
+- (void)zoomIn:(id)sender {
+	(void)sender;
+	[self nudgeVisibleZoom:1 target:[self zoomTargetUnderHit:nil]];
+}
+- (void)zoomOut:(id)sender {
+	(void)sender;
+	[self nudgeVisibleZoom:-1 target:[self zoomTargetUnderHit:nil]];
+}
+
+- (NSEvent *)handleCommandZoom:(NSEvent *)event {
+	if (event.window != _window || (event.modifierFlags & NSEventModifierFlagCommand) == 0) {
+		_cmdZoomAccum = 0;
+		return event;
+	}
+	NSView *content = event.window.contentView;
+	NSView *hit = [content hitTest:[content convertPoint:event.locationInWindow fromView:nil]];
+	id target = [self zoomTargetUnderHit:hit];
+	if (!target) {
+		return event;
+	}
+	NSInteger steps = 0;
+	if (event.hasPreciseScrollingDeltas) {
+		_cmdZoomAccum += event.scrollingDeltaY;
+		while (_cmdZoomAccum >= 12) {
+			steps++;
+			_cmdZoomAccum -= 12;
+		}
+		while (_cmdZoomAccum <= -12) {
+			steps--;
+			_cmdZoomAccum += 12;
+		}
+		if (event.phase == NSEventPhaseEnded || event.phase == NSEventPhaseCancelled) {
+			_cmdZoomAccum = 0;
+		}
+	} else if (event.scrollingDeltaY > 0) {
+		steps = 1;
+	} else if (event.scrollingDeltaY < 0) {
+		steps = -1;
+	}
+	NSInteger direction = steps > 0 ? 1 : -1;
+	for (NSInteger index = 0; index < labs(steps); index++) {
+		[self nudgeVisibleZoom:direction target:target];
+	}
+	return nil;
+}
+- (void)foldAll:(id)sender { (void)sender; [[self activeEditor] message:SCI_FOLDALL wParam:SC_FOLDACTION_CONTRACT lParam:0]; }
+- (void)unfoldAll:(id)sender { (void)sender; [[self activeEditor] message:SCI_FOLDALL wParam:SC_FOLDACTION_EXPAND lParam:0]; }
 
 - (void)chooseEncoding:(NSMenuItem *)sender {
 	DocumentTab *document = [self currentDocument];
@@ -3552,7 +5502,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)sender;
 	DocumentTab *document = [self currentDocument];
 	document.manualLanguage = NO;
-	LangInfo *info = [_catalog languageForPath:document.path sample:[document utf8Text]];
+	NppUserLanguage *user = [_userLanguages languageForPath:document.path];
+	LangInfo *info = user ? [user langInfo] : [_catalog languageForPath:document.path sample:[document utf8Text]];
 	[document applyLanguage:info dark:[self darkAppearance]];
 }
 
@@ -3662,8 +5613,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (!document) {
 		return @"";
 	}
-	long start = [document.editor message:SCI_GETSELECTIONSTART];
-	long end = [document.editor message:SCI_GETSELECTIONEND];
+	ScintillaView *editor = [self activeEditor] ?: document.editor;
+	long start = [editor message:SCI_GETSELECTIONSTART];
+	long end = [editor message:SCI_GETSELECTIONEND];
 	if (end < start) {
 		long swap = start;
 		start = end;
@@ -3678,13 +5630,13 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	range.chrg.cpMin = start;
 	range.chrg.cpMax = end;
 	range.lpstrText = buffer.data();
-	[document.editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	[editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
 	return [[NSString alloc] initWithBytes:buffer.data() length:(NSUInteger)length encoding:NSUTF8StringEncoding] ?: @"";
 }
 
 - (void)replaceSelection:(NSString *)text {
 	const char *bytes = text.UTF8String ?: "";
-	[[self currentDocument].editor message:SCI_REPLACESEL wParam:0 lParam:(sptr_t)bytes];
+	[[self activeEditor] message:SCI_REPLACESEL wParam:0 lParam:(sptr_t)bytes];
 }
 
 - (void)insertText:(NSString *)text {
@@ -3702,7 +5654,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (void)setStatusText:(NSString *)text {
-	_statusOverride = text;
+	_statusOverride = text.length ? NppL(text) : text;
 	[self refreshStatus];
 }
 
@@ -3712,7 +5664,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	}
 	BOOL on = [self currentDocument].fileMonitoring;
 	_tailButton.state = on ? NSControlStateValueOn : NSControlStateValueOff;
-	_tailButton.toolTip = on ? @"Stop tail -f" : @"Start tail -f";
+	_tailButton.toolTip = on ? NppL(@"Stop tail -f") : NppL(@"Start tail -f");
 }
 
 - (void)refreshStatus {
@@ -3727,24 +5679,51 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	long line = [document.editor message:SCI_LINEFROMPOSITION wParam:(uptr_t)position lParam:0] + 1;
 	long column = [document.editor message:SCI_GETCOLUMN wParam:(uptr_t)position lParam:0] + 1;
 	const char *eol = document.eolMode == SC_EOL_CRLF ? "Windows (CRLF)" : document.eolMode == SC_EOL_CR ? "Classic Mac (CR)" : "Unix (LF)";
-	NSString *language = document.language.length ? document.language : @"Normal Text";
+	NSString *eolName = NppL(@(eol));
+	NSString *language = document.language.length ? document.language : NppL(@"Normal Text");
 	if ([language isEqualToString:@"normal"] || [document.lexerName isEqualToString:@"null"]) {
-		language = @"Normal Text";
+		language = NppL(@"Normal Text");
 	} else if ([language isEqualToString:@"javascript.js"]) {
 		language = @"JavaScript";
 	} else if ([language isEqualToString:@"json5"]) {
 		language = @"JSON5";
 	}
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (office.kind == NppOfficeKindPDF) {
+		language = NppL(@"PDF");
+	} else if (office.kind == NppOfficeKindDOC || office.kind == NppOfficeKindDOCX) {
+		language = NppL(@"Word, text only");
+	} else if (office.kind == NppOfficeKindCSV && office.showTable) {
+		language = NppL(@"CSV table");
+	} else if (office.kind == NppOfficeKindXLSX) {
+		language = NppL(@"Excel table");
+	}
 	if (document.fileMonitoring) {
-		language = [language stringByAppendingString:@"    tail -f"];
+		language = [language stringByAppendingString:[@"    " stringByAppendingString:NppL(@"Monitoring (tail -f)")]];
 	}
 	if (_macro.recording) {
-		language = [language stringByAppendingString:@"    RECORDING"];
+		language = [language stringByAppendingFormat:@"    %@", NppL(@"RECORDING")];
 	}
 	long length = [document.editor message:SCI_GETLENGTH];
-	NSString *base = [NSString stringWithFormat:@"  Ln %ld, Col %ld     %@     %s     %@     length %ld     %@", line, column, @(EncodingName(document.encoding)), eol, language, length, document.path.length ? document.path : @"unsaved"];
+	NSString *fileName = document.displayName.length ? document.displayName : NppL(@"Untitled");
+	_window.title = [NSString stringWithFormat:@"%@ — Simeiomatarion", fileName];
+	_status.lineBreakMode = NSLineBreakByTruncatingTail;
+	_status.cell.wraps = NO;
+	_status.toolTip = document.path.length ? document.path : fileName;
+	NSString *sizeText = @"";
+	if (_settings.showFileSize) {
+		unsigned long long bytes = (unsigned long long)MAX(0, length);
+		if (document.path.length && !document.dirty) {
+			NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:document.path error:nil];
+			if (attributes) {
+				bytes = [attributes fileSize];
+			}
+		}
+		sizeText = [NSString stringWithFormat:@"     %@", NppFormatByteCount(bytes, _settings.fileSizeUnit)];
+	}
+	NSString *base = [NSString stringWithFormat:@"  %@     %@ %ld, %@ %ld     %@     %@     %@     %@ %ld%@", fileName, NppL(@"Ln"), line, NppL(@"Col"), column, @(EncodingName(document.encoding)), eolName, language, NppL(@"length"), length, sizeText];
 	_status.stringValue = _statusOverride.length ? [NSString stringWithFormat:@"%@     %@", base, _statusOverride] : base;
-	[self syncEncodingChecks:[NSApp.mainMenu itemWithTitle:@"Encoding"].submenu document:document];
+	[self syncEncodingChecks:[self menuIdentified:@"Encoding"] document:document];
 }
 
 - (void)syncEncodingChecks:(NSMenu *)menu document:(DocumentTab *)document {
@@ -3759,6 +5738,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 }
 
 - (void)documentTabDidScroll:(DocumentTab *)tab {
+	[self updateMinimapViewport:tab];
 	if (!_settings.syncScroll || _syncingScroll || _paneDocuments.count < 2) {
 		return;
 	}
@@ -3787,6 +5767,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSTabViewItem *item = [self itemForDocument:tab];
 	item.label = tab.title;
 	[self rebuildTabStrip];
+	[NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(refreshLivePanels) object:nil];
+	[self performSelector:@selector(refreshLivePanels) withObject:nil afterDelay:0.08];
 }
 
 - (void)documentTab:(DocumentTab *)tab insertedText:(NSString *)text at:(NSInteger)position {
@@ -3827,8 +5809,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 - (void)showAbout:(id)sender {
 	(void)sender;
 	NSAlert *alert = [NSAlert new];
-	alert.messageText = @"Notepad++ for Apple Silicon";
-	alert.informativeText = @"Native arm64 port of Notepad++ 8.9.8.1.\nEditing engine: Scintilla 5.6.6 and Lexilla 5.5.3 from that release, with Notepad++'s Boost regular-expression search.\nThe Win32 shell and Windows plugins cannot run on macOS. This application is a GPL-3 derivative of Notepad++, Copyright 2021 Don HO and contributors.";
+	alert.messageText = @"Simeiomatarion";
+	alert.informativeText = @"Text editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.";
 	[alert runModal];
 }
 
@@ -3843,48 +5825,284 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return field;
 }
 
+- (NSMenu *)menuIdentified:(NSString *)identifier {
+	for (NSMenuItem *item in NSApp.mainMenu.itemArray) {
+		if ([item.submenu.identifier isEqualToString:identifier]) {
+			return item.submenu;
+		}
+	}
+	return nil;
+}
+
+- (void)backupFileIfNeeded:(NSString *)path {
+	NSFileManager *files = [NSFileManager defaultManager];
+	if (!_settings.backupBeforeSave || path.length == 0 || ![files fileExistsAtPath:path]) {
+		return;
+	}
+	NSString *directory = [SupportDirectory().path stringByAppendingPathComponent:@"backups"];
+	[files createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	NSDateFormatter *formatter = [NSDateFormatter new];
+	formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+	formatter.dateFormat = @"yyyyMMdd-HHmmss";
+	NSString *name = [NSString stringWithFormat:@"%@-%@", path.lastPathComponent, [formatter stringFromDate:[NSDate date]]];
+	[files copyItemAtPath:path toPath:[directory stringByAppendingPathComponent:name] error:nil];
+	NSURL *folder = [NSURL fileURLWithPath:directory isDirectory:YES];
+	NSArray<NSURL *> *entries = [files contentsOfDirectoryAtURL:folder includingPropertiesForKeys:@[NSURLContentModificationDateKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+	entries = [entries sortedArrayUsingComparator:^NSComparisonResult(NSURL *left, NSURL *right) {
+		NSDate *leftDate = nil;
+		NSDate *rightDate = nil;
+		[left getResourceValue:&leftDate forKey:NSURLContentModificationDateKey error:nil];
+		[right getResourceValue:&rightDate forKey:NSURLContentModificationDateKey error:nil];
+		return [rightDate ?: NSDate.distantPast compare:leftDate ?: NSDate.distantPast];
+	}];
+	for (NSUInteger index = 30; index < entries.count; index++) {
+		[files removeItemAtURL:entries[index] error:nil];
+	}
+}
+
+- (void)noteSearch:(NSString *)query inEditor:(ScintillaView *)editor {
+	if (_settings.highlightMatches && query.length) {
+		NppHighlightMatches(editor, query, [self searchFlags]);
+	} else {
+		NppClearSearchHighlights(editor);
+	}
+	if (query.length == 0) {
+		return;
+	}
+	NSString *previous = _settings.searchHistory.firstObject;
+	[_settings rememberSearch:query];
+	if ([previous isEqualToString:_settings.searchHistory.firstObject]) {
+		return;
+	}
+	NSError *error = nil;
+	[_settings saveToURL:[SupportDirectory() URLByAppendingPathComponent:@"settings.json"] error:&error];
+	[self buildMenus];
+}
+
+- (void)newWindow:(id)sender {
+	(void)sender;
+	if (!_settings.extraWindows) {
+		return;
+	}
+	NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+	configuration.createsNewApplicationInstance = YES;
+	[[NSWorkspace sharedWorkspace] openApplicationAtURL:NSBundle.mainBundle.bundleURL configuration:configuration completionHandler:nil];
+}
+
+- (void)moveDocumentToNewWindow:(DocumentTab *)document {
+	if (!_settings.extraWindows || !document || ![_documents containsObject:document]) {
+		return;
+	}
+	if (document.dirty || document.path.length == 0) {
+		[self alert:@"Save the document before moving it to a new window."];
+		return;
+	}
+	NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
+	configuration.createsNewApplicationInstance = YES;
+	configuration.arguments = @[document.path];
+	NSString *path = document.path;
+	[[NSWorkspace sharedWorkspace] openApplicationAtURL:NSBundle.mainBundle.bundleURL configuration:configuration completionHandler:^(NSRunningApplication *application, NSError *error) {
+		(void)error;
+		if (!application) {
+			return;
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (![_documents containsObject:document] || ![document.path isEqualToString:path]) {
+				return;
+			}
+			NSInteger pane = [self paneIndexOfDocument:document];
+			[self showDocument:document inPane:pane == NSNotFound ? 0 : pane];
+			[self closeDocument:nil];
+		});
+	}];
+}
+
+- (void)replaceEditorText:(NSString *)text {
+	DocumentTab *document = [self currentDocument];
+	ScintillaView *editor = [self activeEditor] ?: document.editor;
+	if (!document || !editor) {
+		return;
+	}
+	document.suppressMacro = YES;
+	[editor setString:text ?: @""];
+	[editor message:SCI_COLOURISE wParam:0 lParam:-1];
+	document.suppressMacro = NO;
+	document.dirty = YES;
+	[self refreshStatus];
+}
+
+- (void)formatJSON:(id)sender {
+	(void)sender;
+	if (!_settings.formatDocuments) {
+		return;
+	}
+	NSString *error = nil;
+	NSString *pretty = NppPrettyJSON([[self currentDocument] utf8Text], &error);
+	if (!pretty) {
+		[self alert:error.length ? error : @"Invalid JSON."];
+		return;
+	}
+	[self replaceEditorText:pretty];
+}
+
+- (void)formatXML:(id)sender {
+	(void)sender;
+	if (!_settings.formatDocuments) {
+		return;
+	}
+	NSString *error = nil;
+	NSString *pretty = NppPrettyXML([[self currentDocument] utf8Text], &error);
+	if (!pretty) {
+		[self alert:error.length ? error : @"Invalid XML."];
+		return;
+	}
+	[self replaceEditorText:pretty];
+}
+
+- (void)insertCharacter:(id)sender {
+	NSString *symbol = [sender title];
+	ScintillaView *editor = [self activeEditor];
+	if (!editor || symbol.length == 0) {
+		return;
+	}
+	[editor message:SCI_REPLACESEL wParam:0 lParam:(sptr_t)symbol.UTF8String];
+}
+
+- (void)showCharacterPanel:(id)sender {
+	(void)sender;
+	if (!_settings.showCharacterPanel) {
+		return;
+	}
+	if (!_characterPanel) {
+		_characterPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 372, 230) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow backing:NSBackingStoreBuffered defer:NO];
+		_characterPanel.releasedWhenClosed = NO;
+		NSArray<NSString *> *symbols = @[@"—", @"–", @"…", @"“", @"”", @"‘", @"’", @"«", @"»", @"•", @"·", @"°", @"±", @"×", @"÷", @"≠", @"≤", @"≥", @"∞", @"√", @"π", @"λ", @"€", @"£", @"¥", @"©", @"®", @"™", @"→", @"←", @"↑", @"↓", @"⇒", @"⌘", @"⌥", @"⇧", @"§", @"¶", @"†", @"‡", @"✓", @"✗"];
+		CGFloat x = 10;
+		CGFloat y = 188;
+		for (NSString *symbol in symbols) {
+			NSButton *button = [NSButton buttonWithTitle:symbol target:self action:@selector(insertCharacter:)];
+			button.bezelStyle = NSBezelStyleRounded;
+			button.font = [NSFont systemFontOfSize:14];
+			button.frame = NSMakeRect(x, y, 36, 28);
+			[_characterPanel.contentView addSubview:button];
+			x += 40;
+			if (x > 330) {
+				x = 10;
+				y -= 36;
+			}
+		}
+	}
+	_characterPanel.title = NppL(@"Character Panel…");
+	[_characterPanel center];
+	[_characterPanel makeKeyAndOrderFront:nil];
+}
+
+- (void)chooseAppearance:(id)sender {
+	NSInteger choice = [sender tag];
+	_settings.theme = choice == 1 ? @"light" : (choice == 2 ? @"dark" : @"system");
+	NSError *error = nil;
+	[_settings saveToURL:[SupportDirectory() URLByAppendingPathComponent:@"settings.json"] error:&error];
+	[self applyWindowTheme];
+	[self buildMenus];
+	for (DocumentTab *document in _documents) {
+		[document applySettings:_settings dark:[self darkAppearance]];
+	}
+}
+
+- (void)findFromHistory:(id)sender {
+	NSString *query = [sender representedObject];
+	if (![query isKindOfClass:[NSString class]] || query.length == 0) {
+		return;
+	}
+	_findField.stringValue = query;
+	if (_workspace.findBar.hidden) {
+		[self showFind:nil];
+	}
+	[self findNext:sender];
+}
+
+- (void)beginShortcutCapture:(id)sender {
+	_captureShortcut = YES;
+	NSButton *button = [sender isKindOfClass:[NSButton class]] ? sender : [_preferencesWindow.contentView viewWithTag:822];
+	button.title = NppL(@"Listening for the next shortcut.");
+	[_preferencesWindow makeFirstResponder:nil];
+}
+
 - (void)showPreferences:(id)sender {
 	(void)sender;
 	if (!_preferencesWindow) {
-		_preferencesWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 560, 520) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
-		_preferencesWindow.title = @"Preferences";
+		_preferencesWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 640, 780) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+		_preferencesWindow.title = NppL(@"Preferences");
 		_preferencesWindow.releasedWhenClosed = NO;
 		NSView *content = _preferencesWindow.contentView;
-		[self preferenceField:@"Font" frame:NSMakeRect(20, 470, 250, 24) value:@"" tag:801 in:content];
-		[self preferenceField:@"Size" frame:NSMakeRect(20, 436, 80, 24) value:@"" tag:802 in:content];
-		[self preferenceField:@"Tab width" frame:NSMakeRect(20, 402, 80, 24) value:@"" tag:803 in:content];
-		NSButton *spaces = [NSButton checkboxWithTitle:@"Insert spaces instead of tabs" target:nil action:nil];
-		spaces.frame = NSMakeRect(20, 368, 260, 24);
-		spaces.tag = 804;
-		NSButton *wrap = [NSButton checkboxWithTitle:@"Word wrap" target:nil action:nil];
-		wrap.frame = NSMakeRect(20, 340, 160, 24);
-		wrap.tag = 805;
-		NSButton *numbers = [NSButton checkboxWithTitle:@"Line numbers" target:nil action:nil];
-		numbers.frame = NSMakeRect(190, 340, 140, 24);
-		numbers.tag = 806;
-		NSButton *whitespace = [NSButton checkboxWithTitle:@"Show whitespace" target:nil action:nil];
-		whitespace.frame = NSMakeRect(340, 340, 180, 24);
-		whitespace.tag = 807;
-		NSTextField *themeLabel = [NSTextField labelWithString:@"Appearance"];
-		themeLabel.frame = NSMakeRect(20, 304, 120, 24);
-		NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, 300, 180, 28) pullsDown:NO];
+		[self preferenceField:NppL(@"Font") frame:NSMakeRect(20, 730, 250, 24) value:@"" tag:801 in:content];
+		[self preferenceField:NppL(@"Size") frame:NSMakeRect(20, 696, 80, 24) value:@"" tag:802 in:content];
+		[self preferenceField:NppL(@"Tab width") frame:NSMakeRect(20, 662, 80, 24) value:@"" tag:803 in:content];
+		NSArray *checks = @[
+			@[NppL(@"Insert spaces instead of tabs"), @804, @20, @626],
+			@[NppL(@"Word wrap"), @805, @20, @598],
+			@[NppL(@"Line numbers"), @806, @220, @598],
+			@[NppL(@"Show whitespace"), @807, @420, @598],
+			@[NppL(@"Ask before closing a tab, folder, or the window"), @809, @20, @570],
+			@[NppL(@"Auto-close brackets and quotes"), @810, @20, @470],
+			@[NppL(@"Indent when Enter opens a block"), @811, @20, @442],
+			@[NppL(@"Highlight every search match"), @812, @20, @414],
+			@[NppL(@"Show edits since the last save"), @813, @20, @386],
+			@[NppL(@"Keep a backup before each save"), @814, @20, @358],
+			@[NppL(@"Spell check plain text and Markdown"), @815, @330, @470],
+			@[NppL(@"Show the file size"), @816, @330, @442],
+			@[NppL(@"Character panel"), @817, @330, @414],
+			@[NppL(@"Open a dragged tab in a new window"), @818, @330, @386],
+			@[NppL(@"Format JSON and XML"), @819, @330, @358]
+		];
+		NSMutableArray *views = [NSMutableArray array];
+		for (NSArray *check in checks) {
+			NSButton *button = [NSButton checkboxWithTitle:check[0] target:nil action:nil];
+			button.frame = NSMakeRect([check[2] doubleValue], [check[3] doubleValue], 300, 24);
+			button.tag = [check[1] integerValue];
+			[views addObject:button];
+		}
+		NSTextField *themeLabel = [NSTextField labelWithString:NppL(@"Appearance")];
+		themeLabel.frame = NSMakeRect(20, 534, 120, 24);
+		NSPopUpButton *theme = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, 530, 180, 28) pullsDown:NO];
 		theme.tag = 808;
-		[theme addItemsWithTitles:@[@"Follow System", @"Light", @"Dark"]];
-		NSButton *confirmClose = [NSButton checkboxWithTitle:@"Ask before closing a tab, folder, or the window" target:nil action:nil];
-		confirmClose.frame = NSMakeRect(20, 268, 420, 24);
-		confirmClose.tag = 809;
-		NSTextField *shortcutLabel = [NSTextField labelWithString:@"Shortcuts, one per line as command=keys"];
-		shortcutLabel.frame = NSMakeRect(20, 240, 400, 20);
-		NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 60, 520, 172)];
+		[theme addItemsWithTitles:@[NppL(@"System"), NppL(@"White"), NppL(@"Dark")]];
+		NSTextField *languageLabel = [NSTextField labelWithString:NppL(@"Language")];
+		languageLabel.frame = NSMakeRect(20, 322, 120, 24);
+		NSPopUpButton *language = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, 318, 180, 28) pullsDown:NO];
+		language.tag = 820;
+		[language addItemsWithTitles:@[NppL(@"Follow System"), @"English", NppL(@"Greek")]];
+		NSTextField *unitLabel = [NSTextField labelWithString:NppL(@"File size")];
+		unitLabel.frame = NSMakeRect(360, 322, 90, 24);
+		NSPopUpButton *unit = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(450, 318, 160, 28) pullsDown:NO];
+		unit.tag = 821;
+		[unit addItemsWithTitles:@[NppL(@"KB or MB"), NppL(@"Always KB"), NppL(@"Always MB")]];
+		NSTextField *shortcutLabel = [NSTextField labelWithString:NppL(@"Shortcuts. Edit the keys column, for example cmd+shift+k")];
+		shortcutLabel.frame = NSMakeRect(20, 286, 460, 20);
+		NSButton *record = [self button:@"Record keys" action:@selector(beginShortcutCapture:) frame:NSMakeRect(490, 280, 130, 28)];
+		record.tag = 822;
+		NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(20, 60, 600, 210)];
 		scroll.hasVerticalScroller = YES;
 		scroll.borderType = NSBezelBorder;
-		_preferencesShortcuts = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 500, 200)];
-		_preferencesShortcuts.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
-		_preferencesShortcuts.automaticQuoteSubstitutionEnabled = NO;
-		scroll.documentView = _preferencesShortcuts;
-		NSButton *save = [self button:@"Save" action:@selector(savePreferences:) frame:NSMakeRect(360, 16, 80, 28)];
-		NSButton *cancel = [self button:@"Cancel" action:@selector(closePreferences:) frame:NSMakeRect(450, 16, 90, 28)];
-		for (NSView *view in @[spaces, wrap, numbers, whitespace, themeLabel, theme, confirmClose, shortcutLabel, scroll, save, cancel]) {
+		_shortcutTable = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, 580, 210)];
+		NSTableColumn *commandColumn = [[NSTableColumn alloc] initWithIdentifier:@"command"];
+		commandColumn.title = NppL(@"Command");
+		commandColumn.width = 250;
+		commandColumn.editable = NO;
+		NSTableColumn *keysColumn = [[NSTableColumn alloc] initWithIdentifier:@"keys"];
+		keysColumn.title = NppL(@"Keys");
+		keysColumn.width = 300;
+		keysColumn.editable = YES;
+		[_shortcutTable addTableColumn:commandColumn];
+		[_shortcutTable addTableColumn:keysColumn];
+		_shortcutTable.dataSource = self;
+		_shortcutTable.delegate = self;
+		_shortcutTable.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
+		scroll.documentView = _shortcutTable;
+		NSButton *save = [self button:@"Save" action:@selector(savePreferences:) frame:NSMakeRect(430, 16, 80, 28)];
+		NSButton *cancel = [self button:@"Cancel" action:@selector(closePreferences:) frame:NSMakeRect(520, 16, 100, 28)];
+		[views addObjectsFromArray:@[themeLabel, theme, languageLabel, language, unitLabel, unit, shortcutLabel, record, scroll, save, cancel]];
+		for (NSView *view in views) {
 			[content addSubview:view];
 		}
 	}
@@ -3897,6 +6115,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSButton *whitespace = [_preferencesWindow.contentView viewWithTag:807];
 	NSPopUpButton *theme = [_preferencesWindow.contentView viewWithTag:808];
 	NSButton *confirmClose = [_preferencesWindow.contentView viewWithTag:809];
+	NSPopUpButton *language = [_preferencesWindow.contentView viewWithTag:820];
+	NSPopUpButton *unit = [_preferencesWindow.contentView viewWithTag:821];
 	font.stringValue = _settings.fontName ?: @"Menlo";
 	size.stringValue = [NSString stringWithFormat:@"%d", _settings.fontSize];
 	tabs.stringValue = [NSString stringWithFormat:@"%d", _settings.tabWidth];
@@ -3906,11 +6126,30 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	whitespace.state = _settings.showWhitespace ? NSControlStateValueOn : NSControlStateValueOff;
 	[theme selectItemAtIndex:[_settings.theme isEqualToString:@"light"] ? 1 : ([_settings.theme isEqualToString:@"dark"] ? 2 : 0)];
 	confirmClose.state = _settings.confirmClose ? NSControlStateValueOn : NSControlStateValueOff;
-	NSMutableString *shortcutText = [NSMutableString string];
-	for (NSString *command in [_settings.shortcuts.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
-		[shortcutText appendFormat:@"%@=%@\n", command, _settings.shortcuts[command]];
+	for (NSNumber *tag in @[@810, @811, @812, @813, @814, @815, @816, @817, @818, @819]) {
+		NSButton *button = [_preferencesWindow.contentView viewWithTag:tag.integerValue];
+		BOOL value = YES;
+		switch (tag.integerValue) {
+			case 810: value = _settings.autoClose; break;
+			case 811: value = _settings.smartIndent; break;
+			case 812: value = _settings.highlightMatches; break;
+			case 813: value = _settings.showChanges; break;
+			case 814: value = _settings.backupBeforeSave; break;
+			case 815: value = _settings.spellCheck; break;
+			case 816: value = _settings.showFileSize; break;
+			case 817: value = _settings.showCharacterPanel; break;
+			case 818: value = _settings.extraWindows; break;
+			case 819: value = _settings.formatDocuments; break;
+		}
+		button.state = value ? NSControlStateValueOn : NSControlStateValueOff;
 	}
-	_preferencesShortcuts.string = shortcutText;
+	[language selectItemAtIndex:[_settings.uiLanguage isEqualToString:@"en"] ? 1 : ([_settings.uiLanguage isEqualToString:@"el"] ? 2 : 0)];
+	[unit selectItemAtIndex:[_settings.fileSizeUnit isEqualToString:@"kb"] ? 1 : ([_settings.fileSizeUnit isEqualToString:@"mb"] ? 2 : 0)];
+	_shortcutRows = [NSMutableArray array];
+	for (NSString *command in [_settings.shortcuts.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+		[_shortcutRows addObject:[@{@"command": command, @"keys": _settings.shortcuts[command] ?: @""} mutableCopy]];
+	}
+	[_shortcutTable reloadData];
 	[_preferencesWindow center];
 	[_preferencesWindow makeKeyAndOrderFront:nil];
 }
@@ -3932,6 +6171,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSButton *whitespace = [content viewWithTag:807];
 	NSPopUpButton *theme = [content viewWithTag:808];
 	NSButton *confirmClose = [content viewWithTag:809];
+	NSPopUpButton *language = [content viewWithTag:820];
+	NSPopUpButton *unit = [content viewWithTag:821];
+	NSString *previousLanguage = _settings.uiLanguage;
 	_settings.fontName = font.stringValue.length ? font.stringValue : @"Menlo";
 	_settings.fontSize = MAX(6, MIN(72, size.stringValue.intValue));
 	_settings.tabWidth = MAX(1, MIN(32, tabs.stringValue.intValue));
@@ -3941,11 +6183,23 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_settings.showWhitespace = whitespace.state == NSControlStateValueOn;
 	_settings.theme = theme.indexOfSelectedItem == 1 ? @"light" : (theme.indexOfSelectedItem == 2 ? @"dark" : @"system");
 	_settings.confirmClose = confirmClose.state == NSControlStateValueOn;
+	_settings.autoClose = [(NSButton *)[content viewWithTag:810] state] == NSControlStateValueOn;
+	_settings.smartIndent = [(NSButton *)[content viewWithTag:811] state] == NSControlStateValueOn;
+	_settings.highlightMatches = [(NSButton *)[content viewWithTag:812] state] == NSControlStateValueOn;
+	_settings.showChanges = [(NSButton *)[content viewWithTag:813] state] == NSControlStateValueOn;
+	_settings.backupBeforeSave = [(NSButton *)[content viewWithTag:814] state] == NSControlStateValueOn;
+	_settings.spellCheck = [(NSButton *)[content viewWithTag:815] state] == NSControlStateValueOn;
+	_settings.showFileSize = [(NSButton *)[content viewWithTag:816] state] == NSControlStateValueOn;
+	_settings.showCharacterPanel = [(NSButton *)[content viewWithTag:817] state] == NSControlStateValueOn;
+	_settings.extraWindows = [(NSButton *)[content viewWithTag:818] state] == NSControlStateValueOn;
+	_settings.formatDocuments = [(NSButton *)[content viewWithTag:819] state] == NSControlStateValueOn;
+	_settings.uiLanguage = language.indexOfSelectedItem == 1 ? @"en" : (language.indexOfSelectedItem == 2 ? @"el" : @"system");
+	_settings.fileSizeUnit = unit.indexOfSelectedItem == 1 ? @"kb" : (unit.indexOfSelectedItem == 2 ? @"mb" : @"auto");
+	NppSetUILanguage(_settings.uiLanguage);
 	NSMutableDictionary *shortcutMap = [NSMutableDictionary dictionary];
-	for (NSString *line in [_preferencesShortcuts.string componentsSeparatedByString:@"\n"]) {
-		NSArray<NSString *> *parts = [line componentsSeparatedByString:@"="];
-		if (parts.count == 2 && parts[0].length && parts[1].length) {
-			shortcutMap[parts[0]] = parts[1];
+	for (NSDictionary *row in _shortcutRows) {
+		if ([row[@"command"] length] && [row[@"keys"] length]) {
+			shortcutMap[row[@"command"]] = row[@"keys"];
 		}
 	}
 	if (shortcutMap.count) {
@@ -3959,7 +6213,23 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		[document applySettings:_settings dark:[self darkAppearance]];
 	}
 	[self updateSplitWrapping];
+	NSView *toolbarButtons = [_toolbar isKindOfClass:[NSScrollView class]] ? ((NSScrollView *)_toolbar).documentView : _toolbar;
+	for (NSView *view in toolbarButtons.subviews) {
+		if ([view isKindOfClass:[NSButton class]] && view.identifier.length) {
+			NSButton *button = (NSButton *)view;
+			button.title = NppL(button.identifier);
+			if ([button.identifier isEqualToString:@"Format JSON"] || [button.identifier isEqualToString:@"Format XML"]) {
+				button.enabled = _settings.formatDocuments;
+			}
+		}
+	}
+	[self updateTailButton];
 	[_preferencesWindow close];
+	if (![previousLanguage isEqualToString:_settings.uiLanguage]) {
+		_preferencesWindow = nil;
+		_shortcutTable = nil;
+	}
+	[self refreshStatus];
 }
 
 - (void)revealInFinder:(id)sender {
@@ -4019,7 +6289,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (void)showCompareIndex:(NSInteger)index {
 	if (_compareRows.count == 0) {
-		_compareLabel.stringValue = @"The two panes match.";
+		_compareLabel.stringValue = NppL(@"The two panes match.");
 		return;
 	}
 	if (index < 0) {
@@ -4041,7 +6311,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self revealCompareLine:[row[@"line"] integerValue] in:focus];
 	[self revealCompareLine:[row[@"peer"] integerValue] in:other];
 	_syncingScroll = NO;
-	_compareLabel.stringValue = [NSString stringWithFormat:@"Difference %ld of %ld", (long)(index + 1), (long)_compareRows.count];
+	NSString *kind = NppL(removed ? @"Removed" : @"Added");
+	_compareLabel.stringValue = [NSString stringWithFormat:@"%@ · %@ %ld / %ld", kind, NppL(@"Difference"), (long)(index + 1), (long)_compareRows.count];
 }
 
 - (void)comparePrevious:(id)sender {
@@ -4169,6 +6440,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 - (void)controlTextDidChange:(NSNotification *)notification {
 	if (notification.object == _quickOpenField) {
 		[self reloadQuickOpen];
+	} else if (notification.object == _folderFindField) {
+		[self scheduleFolderSearch];
 	}
 }
 
@@ -4228,24 +6501,45 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	}
 }
 
+- (NSButton *)sidebarButton:(NSString *)symbol tip:(NSString *)tip action:(SEL)action {
+	NSImage *image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:NppL(tip)];
+	image.size = NSMakeSize(13, 13);
+	NSButton *button = [NSButton buttonWithImage:image target:self action:action];
+	button.bezelStyle = NSBezelStyleTexturedRounded;
+	button.imageScaling = NSImageScaleProportionallyDown;
+	button.imagePosition = NSImageOnly;
+	button.bordered = YES;
+	button.title = @"";
+	button.toolTip = NppL(tip);
+	return button;
+}
+
 - (NSView *)buildFolderSidebar {
 	NSView *side = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 280, 400)];
 	side.wantsLayer = YES;
+	side.clipsToBounds = YES;
 	side.layer.backgroundColor = NSColor.controlBackgroundColor.CGColor;
-	NSTextField *title = [NSTextField labelWithString:@"Folder"];
-	title.frame = NSMakeRect(10, 0, 150, 18);
+	NSImageView *glyph = [[NSImageView alloc] initWithFrame:NSMakeRect(10, 0, 16, 16)];
+	glyph.image = NppTintedSymbol(@"folder.fill", NSColor.systemBlueColor);
+	glyph.imageScaling = NSImageScaleProportionallyDown;
+	glyph.tag = 6;
+	NSTextField *title = [NSTextField labelWithString:NppL(@"Folder")];
+	title.frame = NSMakeRect(30, 0, 150, 18);
 	title.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+	title.lineBreakMode = NSLineBreakByTruncatingTail;
 	title.tag = 1;
-	NSButton *up = [self button:@"Up" action:@selector(folderUp:) frame:NSMakeRect(0, 0, 36, 22)];
+	NSButton *up = [self sidebarButton:@"chevron.up" tip:@"Enclosing folder" action:@selector(folderUp:)];
 	up.tag = 3;
-	up.toolTip = @"Enclosing folder";
-	NSButton *hide = [self button:@"Hide" action:@selector(closeFolderSidebar:) frame:NSMakeRect(0, 0, 62, 22)];
+	NSButton *symbols = [self sidebarButton:@"list.bullet.indent" tip:@"Symbols" action:@selector(showOutline:)];
+	symbols.tag = 5;
+	NSButton *hide = [self sidebarButton:@"sidebar.left" tip:@"Hide the folder" action:@selector(closeFolderSidebar:)];
 	hide.tag = 4;
-	hide.toolTip = @"Hide the folder";
-	NSTextField *path = [[NSTextField alloc] initWithFrame:NSMakeRect(8, 0, 260, 24)];
+	NSTextField *path = [[NSTextField alloc] initWithFrame:NSMakeRect(8, 0, 260, 22)];
 	path.tag = 2;
+	path.bezelStyle = NSTextFieldRoundedBezel;
 	path.placeholderString = @"Folder path";
-	path.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+	path.font = [NSFont systemFontOfSize:11];
+	path.textColor = NSColor.secondaryLabelColor;
 	path.lineBreakMode = NSLineBreakByTruncatingHead;
 	NSTextFieldCell *pathCell = path.cell;
 	pathCell.wraps = NO;
@@ -4253,9 +6547,22 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	path.target = self;
 	path.action = @selector(commitFolderPath:);
 	path.toolTip = @"Type a folder path and press Return";
+	_folderFindField = [[NSSearchField alloc] initWithFrame:NSMakeRect(8, 0, 260, 22)];
+	_folderFindField.tag = 7;
+	_folderFindField.placeholderString = NppL(@"Find a file");
+	_folderFindField.font = [NSFont systemFontOfSize:12];
+	_folderFindField.sendsSearchStringImmediately = YES;
+	_folderFindField.sendsWholeSearchString = NO;
+	_folderFindField.target = self;
+	_folderFindField.action = @selector(openFolderSearchResult:);
+	_folderFindField.delegate = (id<NSSearchFieldDelegate>)self;
+	NSBox *rule = [[NSBox alloc] initWithFrame:NSMakeRect(0, 0, 280, 1)];
+	rule.boxType = NSBoxSeparator;
+	rule.identifier = @"npp.sidebar.rule";
 	NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 280, 320)];
 	scroll.hasVerticalScroller = YES;
 	scroll.drawsBackground = NO;
+	scroll.identifier = @"npp.folder";
 	_folderOutline = [[NSOutlineView alloc] initWithFrame:NSMakeRect(0, 0, 280, 320)];
 	NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"name"];
 	column.title = @"Name";
@@ -4269,28 +6576,88 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	_folderOutline.target = self;
 	_folderOutline.tag = 901;
 	_folderOutline.style = NSTableViewStyleSourceList;
+	_folderOutline.rowHeight = 24;
+	_folderOutline.intercellSpacing = NSMakeSize(0, 1);
+	_folderOutline.indentationPerLevel = 14;
+	_folderOutline.backgroundColor = NSColor.clearColor;
+	_folderOutline.autoresizesOutlineColumn = YES;
+	column.resizingMask = NSTableColumnAutoresizingMask;
 	scroll.documentView = _folderOutline;
-	for (NSView *view in @[title, up, hide, path, scroll]) {
+	scroll.automaticallyAdjustsContentInsets = NO;
+	scroll.contentInsets = NSEdgeInsetsMake(4, 0, 8, 0);
+	NSScrollView *outlineScroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 280, 320)];
+	outlineScroll.hasVerticalScroller = YES;
+	outlineScroll.drawsBackground = NO;
+	outlineScroll.identifier = @"npp.outline";
+	outlineScroll.hidden = YES;
+	_outlineTable = [[NSTableView alloc] initWithFrame:NSMakeRect(0, 0, 280, 320)];
+	NSTableColumn *symbolColumn = [[NSTableColumn alloc] initWithIdentifier:@"name"];
+	symbolColumn.title = @"Symbol";
+	symbolColumn.width = 190;
+	NSTableColumn *lineColumn = [[NSTableColumn alloc] initWithIdentifier:@"line"];
+	lineColumn.title = @"Line";
+	lineColumn.width = 48;
+	[_outlineTable addTableColumn:symbolColumn];
+	[_outlineTable addTableColumn:lineColumn];
+	_outlineTable.headerView = nil;
+	_outlineTable.rowHeight = 22;
+	_outlineTable.style = NSTableViewStyleSourceList;
+	_outlineTable.backgroundColor = NSColor.clearColor;
+	_outlineTable.intercellSpacing = NSMakeSize(4, 1);
+	_outlineTable.dataSource = self;
+	_outlineTable.delegate = self;
+	_outlineTable.target = self;
+	_outlineTable.doubleAction = @selector(openOutlineRow:);
+	outlineScroll.documentView = _outlineTable;
+	for (NSView *view in @[glyph, title, up, symbols, hide, path, _folderFindField, rule, scroll, outlineScroll]) {
 		[side addSubview:view];
 	}
 	return side;
 }
 
 - (void)layoutFolderSidebar {
+	if (!_sidebar) {
+		return;
+	}
 	CGFloat height = _sidebar.bounds.size.height;
 	CGFloat width = _sidebar.bounds.size.width;
+	_sidebar.layer.backgroundColor = NSColor.controlBackgroundColor.CGColor;
+	CGFloat listTop = _sidebarPage == 1 ? 36 : 96;
+	_folderFindField.placeholderString = NppL(@"Find a file");
 	for (NSView *view in _sidebar.subviews) {
-		if (view.tag == 1) {
-			view.frame = NSMakeRect(10, height - 24, MAX(40, width - 128), 18);
+		if (view.tag == 6) {
+			view.frame = NSMakeRect(10, height - 26, 16, 16);
+		} else if (view.tag == 1) {
+			view.frame = NSMakeRect(32, height - 26, MAX(40, width - 124), 18);
 		} else if (view.tag == 3) {
-			view.frame = NSMakeRect(width - 112, height - 26, 36, 22);
+			view.frame = NSMakeRect(width - 90, height - 28, 26, 22);
+			view.hidden = _sidebarPage == 1;
+		} else if (view.tag == 5) {
+			view.frame = NSMakeRect(width - 60, height - 28, 26, 22);
 		} else if (view.tag == 4) {
-			view.frame = NSMakeRect(width - 72, height - 26, 62, 22);
+			view.frame = NSMakeRect(width - 30, height - 28, 26, 22);
 		} else if (view.tag == 2) {
-			view.frame = NSMakeRect(8, height - 54, MAX(40, width - 16), 24);
-		} else if ([view isKindOfClass:[NSScrollView class]]) {
-			view.frame = NSMakeRect(0, 0, width, MAX(0, height - 62));
+			view.frame = NSMakeRect(8, height - 56, MAX(40, width - 16), 22);
+			view.hidden = _sidebarPage == 1;
+		} else if (view.tag == 7) {
+			view.frame = NSMakeRect(8, height - 84, MAX(40, width - 16), 22);
+			view.hidden = _sidebarPage == 1;
+		} else if ([view.identifier isEqualToString:@"npp.sidebar.rule"]) {
+			view.frame = NSMakeRect(8, height - listTop, MAX(0, width - 16), 1);
+		} else if ([view.identifier isEqualToString:@"npp.folder"]) {
+			view.hidden = _sidebarPage == 1;
+			view.frame = NSMakeRect(0, 0, width, MAX(0, height - listTop));
+		} else if ([view.identifier isEqualToString:@"npp.outline"]) {
+			view.hidden = _sidebarPage != 1;
+			view.frame = NSMakeRect(0, 0, width, MAX(0, height - listTop));
 		}
+	}
+	if (_folderOutline.tableColumns.count) {
+		_folderOutline.tableColumns.firstObject.width = MAX(80, width - 8);
+	}
+	_sidebar.clipsToBounds = YES;
+	if (_folderFindField && _sidebarPage != 1) {
+		_folderFindField.frame = NSMakeRect(8, MAX(0, height - 84), MAX(40, width - 16), 22);
 	}
 }
 
@@ -4312,11 +6679,16 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&directory] || !directory) {
 		return;
 	}
+	_folderSearchGeneration++;
+	_folderQuery = @"";
+	_folderMatches = nil;
+	_folderFindField.stringValue = @"";
 	_folderRoot = path;
 	_folderRootNode = [NppFolderNode new];
 	_folderRootNode.path = path;
 	_folderRootNode.name = path.lastPathComponent;
 	_folderRootNode.directory = YES;
+	_folderRootNode.icon = NppSidebarFileIcon(_folderRootNode.name, path, YES);
 	NSTextField *title = [_sidebar viewWithTag:1];
 	title.stringValue = path.lastPathComponent.length ? path.lastPathComponent : path;
 	title.toolTip = path;
@@ -4381,6 +6753,105 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self showFolderAtPath:path];
 }
 
+static NSArray<NSDictionary *> *NppCollectFolderMatches(NSString *root, NSString *query) {
+	NSString *needle = query.lowercaseString ?: @"";
+	if (root.length == 0 || needle.length == 0) {
+		return @[];
+	}
+	NSFileManager *files = [NSFileManager defaultManager];
+	NSURL *rootURL = [NSURL fileURLWithPath:root isDirectory:YES];
+	NSDirectoryEnumerator *enumerator = [files enumeratorAtURL:rootURL
+		includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+		options:NSDirectoryEnumerationSkipsHiddenFiles | NSDirectoryEnumerationSkipsPackageDescendants
+		errorHandler:nil];
+	NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
+	NSInteger seen = 0;
+	for (NSURL *url in enumerator) {
+		if (++seen > 20000) {
+			break;
+		}
+		NSString *name = url.lastPathComponent ?: @"";
+		if ([name isEqualToString:@"node_modules"]) {
+			[enumerator skipDescendants];
+			continue;
+		}
+		if ([name.lowercaseString rangeOfString:needle].location == NSNotFound) {
+			continue;
+		}
+		NSNumber *directory = nil;
+		[url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:nil];
+		NSString *full = url.path ?: @"";
+		NSString *prefix = [root hasSuffix:@"/"] ? root : [root stringByAppendingString:@"/"];
+		NSString *relative = [full hasPrefix:prefix] ? [full substringFromIndex:prefix.length] : name;
+		[hits addObject:@{
+			@"path": full,
+			@"name": relative.length ? relative : name,
+			@"directory": directory ?: @NO
+		}];
+		if (hits.count >= 200) {
+			break;
+		}
+	}
+	return [hits sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+		return [left[@"name"] localizedCaseInsensitiveCompare:right[@"name"]];
+	}];
+}
+
+- (void)scheduleFolderSearch {
+	NSString *query = [_folderFindField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	NSInteger generation = ++_folderSearchGeneration;
+	_folderQuery = query ?: @"";
+	if (_folderQuery.length == 0 || _folderRoot.length == 0) {
+		_folderMatches = nil;
+		[_folderOutline reloadData];
+		[_folderOutline expandItem:nil expandChildren:NO];
+		return;
+	}
+	NSString *root = _folderRoot;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		if (generation != self->_folderSearchGeneration) {
+			return;
+		}
+		NSArray<NSDictionary *> *found = NppCollectFolderMatches(root, query);
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if (generation != self->_folderSearchGeneration) {
+				return;
+			}
+			NSMutableArray<NppFolderNode *> *nodes = [NSMutableArray array];
+			for (NSDictionary *hit in found) {
+				NppFolderNode *node = [NppFolderNode new];
+				node.path = hit[@"path"];
+				node.name = hit[@"name"];
+				node.directory = [hit[@"directory"] boolValue];
+				node.icon = NppSidebarFileIcon(node.path.lastPathComponent, node.path, node.directory);
+				[nodes addObject:node];
+			}
+			if (nodes.count == 0) {
+				NppFolderNode *empty = [NppFolderNode new];
+				empty.name = NppL(@"No matching files");
+				[nodes addObject:empty];
+			}
+			self->_folderMatches = nodes;
+			[self->_folderOutline reloadData];
+			if (found.count > 0) {
+				[self->_folderOutline selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+			}
+		});
+	});
+}
+
+- (void)openFolderSearchResult:(id)sender {
+	(void)sender;
+	if (_folderQuery.length == 0) {
+		return;
+	}
+	NSInteger row = _folderOutline.selectedRow;
+	if (row < 0 && _folderMatches.count > 0 && _folderMatches.firstObject.path.length > 0) {
+		row = 0;
+	}
+	[self openFolderNode:[_folderOutline itemAtRow:row]];
+}
+
 - (NSArray<NppFolderNode *> *)folderChildren:(NppFolderNode *)node {
 	if (node.loaded) {
 		return node.children;
@@ -4404,6 +6875,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		child.path = childPath;
 		child.name = name;
 		child.directory = directory;
+		child.icon = NppSidebarFileIcon(name, childPath, directory);
 		[(directory ? directories : regular) addObject:child];
 		if (directories.count + regular.count >= 800) {
 			break;
@@ -4421,6 +6893,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (NSInteger)outlineView:(NSOutlineView *)outlineView numberOfChildrenOfItem:(id)item {
 	(void)outlineView;
+	if (_folderQuery.length > 0) {
+		return item == nil ? (NSInteger)_folderMatches.count : 0;
+	}
 	if (!_folderRootNode) {
 		return 0;
 	}
@@ -4430,11 +6905,20 @@ static void HostStatus(NppMacHost *host, const char *text) {
 
 - (BOOL)outlineView:(NSOutlineView *)outlineView isItemExpandable:(id)item {
 	(void)outlineView;
+	if (_folderQuery.length > 0) {
+		return NO;
+	}
 	return [item isKindOfClass:[NppFolderNode class]] && ((NppFolderNode *)item).directory;
 }
 
 - (id)outlineView:(NSOutlineView *)outlineView child:(NSInteger)index ofItem:(id)item {
 	(void)outlineView;
+	if (_folderQuery.length > 0) {
+		if (item != nil || index < 0 || index >= (NSInteger)_folderMatches.count) {
+			return nil;
+		}
+		return _folderMatches[index];
+	}
 	NppFolderNode *node = item ?: _folderRootNode;
 	NSArray<NppFolderNode *> *children = [self folderChildren:node];
 	if (index < 0 || index >= (NSInteger)children.count) {
@@ -4449,10 +6933,39 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	return [item isKindOfClass:[NppFolderNode class]] ? ((NppFolderNode *)item).name : @"";
 }
 
-- (void)openFolderItem:(id)sender {
-	(void)sender;
-	NppFolderNode *node = [_folderOutline itemAtRow:_folderOutline.clickedRow];
-	if (![node isKindOfClass:[NppFolderNode class]]) {
+- (NSView *)outlineView:(NSOutlineView *)outlineView viewForTableColumn:(NSTableColumn *)tableColumn item:(id)item {
+	(void)tableColumn;
+	if (outlineView != _folderOutline || ![item isKindOfClass:[NppFolderNode class]]) {
+		return nil;
+	}
+	NppFolderNode *node = item;
+	NppFolderCell *cell = [outlineView makeViewWithIdentifier:@"npp.folder.cell" owner:self];
+	if (!cell) {
+		cell = [[NppFolderCell alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
+		cell.identifier = @"npp.folder.cell";
+		NSImageView *imageView = [NSImageView imageViewWithImage:[NSImage new]];
+		imageView.imageScaling = NSImageScaleProportionallyUpOrDown;
+		NSTextField *text = [NSTextField labelWithString:@""];
+		text.lineBreakMode = NSLineBreakByTruncatingMiddle;
+		text.font = [NSFont systemFontOfSize:12];
+		text.textColor = NSColor.labelColor;
+		cell.imageView = imageView;
+		cell.textField = text;
+		[cell addSubview:imageView];
+		[cell addSubview:text];
+	}
+	cell.imageView.image = node.icon;
+	cell.textField.stringValue = node.name ?: @"";
+	cell.textField.textColor = node.path.length ? NSColor.labelColor : NSColor.secondaryLabelColor;
+	cell.textField.font = node.directory
+		? [NSFont systemFontOfSize:12 weight:NSFontWeightMedium]
+		: [NSFont systemFontOfSize:12];
+	cell.toolTip = node.path.length ? node.path : node.name;
+	return cell;
+}
+
+- (void)openFolderNode:(NppFolderNode *)node {
+	if (![node isKindOfClass:[NppFolderNode class]] || node.path.length == 0) {
 		return;
 	}
 	if (node.directory) {
@@ -4465,6 +6978,11 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	} else {
 		[self openPath:node.path];
 	}
+}
+
+- (void)openFolderItem:(id)sender {
+	(void)sender;
+	[self openFolderNode:[_folderOutline itemAtRow:_folderOutline.clickedRow]];
 }
 
 - (NSURL *)pluginsDirectory {
@@ -4510,7 +7028,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		auto entry = reinterpret_cast<NppMacPluginEntryFn>(dlsym(handle, "NppMacPluginEntry"));
 		const NppMacPlugin *plugin = entry ? entry() : nullptr;
 		if (!plugin || plugin->abi != NPP_MAC_PLUGIN_ABI) {
-			[_pluginErrors addObject:[NSString stringWithFormat:@"%@: not a Notepad++ Mac plugin", path.lastPathComponent]];
+			[_pluginErrors addObject:[NSString stringWithFormat:@"%@: not a Simeiomatarion plugin", path.lastPathComponent]];
 			dlclose(handle);
 			continue;
 		}
@@ -4656,7 +7174,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		NSAlert *alert = [NSAlert new];
 		alert.messageText = @"This file has been modified by another program.";
 		alert.informativeText = document.dirty
-			? [NSString stringWithFormat:@"%@\n\nReload it and lose the changes made in Notepad++?", document.path]
+			? [NSString stringWithFormat:@"%@\n\nReload it and lose the changes made in Simeiomatarion?", document.path]
 			: [NSString stringWithFormat:@"%@\n\nReload it?", document.path];
 		[alert addButtonWithTitle:@"Reload"];
 		[alert addButtonWithTitle:document.dirty ? @"Keep my changes" : @"Keep"];
@@ -4683,7 +7201,7 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		return NO;
 	}
 	NSAlert *alert = [NSAlert new];
-	alert.messageText = @"Recover unsaved Notepad++ documents?";
+	alert.messageText = @"Recover unsaved Simeiomatarion documents?";
 	alert.informativeText = [NSString stringWithFormat:@"%lu recovery file(s) were found.", (unsigned long)metas.count];
 	[alert addButtonWithTitle:@"Recover"];
 	[alert addButtonWithTitle:@"Discard"];
@@ -4718,7 +7236,11 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	[self addDocument:document];
 	[document setUtf8Text:text ?: @""];
 	[document.editor message:SCI_SETEOLMODE wParam:(uptr_t)document.eolMode lParam:0];
-	LangInfo *info = [_catalog languageNamed:item[@"language"]];
+	document.pinned = [item[@"pinned"] boolValue];
+	LangInfo *info = [_userLanguages langInfoNamed:item[@"language"]];
+	if (!info) {
+		info = [_catalog languageNamed:item[@"language"]];
+	}
 	if (!info && path.length) {
 		info = [_catalog languageForPath:path sample:text];
 	}
@@ -4732,11 +7254,89 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	}
 	[self noteDiskRevisionForDocument:document];
 	[self placeCaretAt:[item[@"position"] integerValue] firstLine:[item[@"firstLine"] integerValue]];
+	[self restoreOfficeDocument:document];
 	return document;
 }
 
+- (void)toggleCsvTable:(id)sender {
+	(void)sender;
+	DocumentTab *document = [self currentDocument];
+	NppOfficeRef *office = [self officeRefForDocument:document];
+	if (office.kind != NppOfficeKindCSV) {
+		return;
+	}
+	office.showTable = !office.showTable;
+	if (office.showTable) {
+		NppCsvView *table = [self csvViewForDocument:document];
+		[table loadCsv:[document utf8Text] ?: @""];
+		if (!table.fitsInTable) {
+			office.showTable = NO;
+			[self alert:@"This CSV is too large for the table."];
+		}
+	}
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (pane != NSNotFound) {
+		[self placeEditor:document inPane:pane];
+		[_window makeFirstResponder:office.showTable ? office.view : document.editor];
+	}
+	[self buildMenus];
+	[self refreshStatus];
+}
+
+- (void)restoreOfficeDocument:(DocumentTab *)document {
+	NppOfficeKind kind = NppOfficeKindForPath(document.path);
+	if (kind == NppOfficeKindCSV) {
+		[self attachCsvDocument:document];
+		NSInteger pane = [self paneIndexOfDocument:document];
+		if (pane != NSNotFound) {
+			[self placeEditor:document inPane:pane];
+		}
+		return;
+	}
+	if (kind == NppOfficeKindXLSX) {
+		[self reloadXlsxDocument:document sheet:nil];
+		return;
+	}
+	if (kind != NppOfficeKindPDF && kind != NppOfficeKindDOC && kind != NppOfficeKindDOCX) {
+		return;
+	}
+	NSString *error = nil;
+	NSView *surface = nil;
+	if (kind == NppOfficeKindPDF) {
+		surface = NppPDFViewForPath(document.path, &error);
+		if (!surface) {
+			return;
+		}
+	} else {
+		NppWordView *word = [[NppWordView alloc] initWithFrame:NSZeroRect];
+		if (![word loadPath:document.path kind:kind error:&error]) {
+			return;
+		}
+		surface = word;
+		if (!document.dirty) {
+			[document.editor setEditable:YES];
+			[document.editor message:SCI_SETREADONLY wParam:0 lParam:0];
+			[document setUtf8Text:word.plainText ?: @""];
+		}
+	}
+	NppOfficeRef *office = [NppOfficeRef new];
+	office.kind = kind;
+	office.view = surface;
+	[self rememberOffice:office forDocument:document];
+	document.manualLanguage = YES;
+	document.language = kind == NppOfficeKindPDF ? @"PDF" : @"Word";
+	[self lockOfficeText:document];
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (pane != NSNotFound) {
+		[self placeEditor:document inPane:pane];
+	}
+}
+
 - (BOOL)restoreSession {
-	NSURL *url = [SupportDirectory() URLByAppendingPathComponent:@"session.json"];
+	return [self restoreSessionAtURL:[SupportDirectory() URLByAppendingPathComponent:@"session.json"]];
+}
+
+- (BOOL)restoreSessionAtURL:(NSURL *)url {
 	id json = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfURL:url] options:0 error:nil];
 	NSArray *items = nil;
 	NSInteger selected = 0;
@@ -4778,6 +7378,9 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	NSString *folder = [json isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)json)[@"folder"] : nil;
 	if ([folder isKindOfClass:[NSString class]] && folder.length) {
 		[self showFolderAtPath:folder];
+	}
+	if ([json isKindOfClass:[NSDictionary class]]) {
+		[self restoreClone:((NSDictionary *)json)[@"clone"]];
 	}
 	return restored > 0;
 }
@@ -4890,7 +7493,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 			@"manualLanguage": @(document.manualLanguage),
 			@"position": @(position),
 			@"firstLine": @(firstLine),
-			@"dirty": @(discard ? NO : document.dirty)
+			@"dirty": @(discard ? NO : document.dirty),
+			@"pinned": @(document.pinned)
 		} mutableCopy];
 		if (keepText) {
 			item[@"text"] = [document utf8Text] ?: @"";
@@ -4934,7 +7538,8 @@ static void HostStatus(NppMacHost *host, const char *text) {
 		@"frame": @[@(frame.origin.x), @(frame.origin.y), @(frame.size.width), @(frame.size.height)],
 		@"documents": documents,
 		@"panes": panes,
-		@"folder": (_workspace.sidebarVisible && _folderRoot.length) ? _folderRoot : @""
+		@"folder": (_workspace.sidebarVisible && _folderRoot.length) ? _folderRoot : @"",
+		@"clone": (_cloneSource && _clonePane != NSNotFound) ? @{@"document": @([_documents indexOfObject:_cloneSource]), @"pane": @(_clonePane)} : @{}
 	};
 	NSData *data = [NSJSONSerialization dataWithJSONObject:session options:0 error:nil];
 	[data writeToURL:[SupportDirectory() URLByAppendingPathComponent:@"session.json"] atomically:YES];
@@ -4970,6 +7575,1026 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	(void)sender;
 	[self openDroppedPaths:filenames];
 	[NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+}
+
+- (NSURL *)sessionsDirectory {
+	NSURL *directory = [SupportDirectory() URLByAppendingPathComponent:@"sessions" isDirectory:YES];
+	[[NSFileManager defaultManager] createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	return directory;
+}
+
+- (NSArray<NSString *> *)namedSessionTitles {
+	NSMutableArray<NSString *> *names = [NSMutableArray array];
+	for (NSURL *url in [[NSFileManager defaultManager] contentsOfDirectoryAtURL:[self sessionsDirectory] includingPropertiesForKeys:nil options:0 error:nil]) {
+		if ([url.pathExtension isEqualToString:@"json"]) {
+			[names addObject:url.URLByDeletingPathExtension.lastPathComponent];
+		}
+	}
+	[names sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+	return names;
+}
+
+- (void)saveNamedSession:(id)sender {
+	(void)sender;
+	NSAlert *alert = [NSAlert new];
+	alert.messageText = @"Save Session";
+	NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
+	field.placeholderString = @"Name";
+	alert.accessoryView = field;
+	[alert addButtonWithTitle:@"Save"];
+	[alert addButtonWithTitle:@"Cancel"];
+	if ([alert runModal] != NSAlertFirstButtonReturn) {
+		return;
+	}
+	NSString *name = [field.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/\\:"];
+	if (name.length == 0 || [name rangeOfCharacterFromSet:bad].location != NSNotFound) {
+		[self alert:@"Use a session name without slashes."];
+		return;
+	}
+	[self saveSession];
+	NSURL *source = [SupportDirectory() URLByAppendingPathComponent:@"session.json"];
+	NSURL *dest = [[self sessionsDirectory] URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"json"]];
+	[[NSFileManager defaultManager] removeItemAtURL:dest error:nil];
+	if (![[NSFileManager defaultManager] copyItemAtURL:source toURL:dest error:nil]) {
+		[self alert:@"The session could not be saved."];
+		return;
+	}
+	[self buildMenus];
+	[self setStatusText:[NSString stringWithFormat:@"Saved session \"%@\".", name]];
+}
+
+- (void)openNamedSession:(NSMenuItem *)sender {
+	NSString *name = sender.representedObject;
+	if (![name isKindOfClass:[NSString class]] || name.length == 0) {
+		return;
+	}
+	if (_documents.count && ![self confirmClosingDocuments:[_documents copy] grouped:YES]) {
+		return;
+	}
+	NSURL *url = [[self sessionsDirectory] URLByAppendingPathComponent:[name stringByAppendingPathExtension:@"json"]];
+	_closingWithoutPrompt = YES;
+	_suppressEmptyDocument = YES;
+	for (DocumentTab *document in [_documents copy]) {
+		NSTabViewItem *item = [self itemForDocument:document];
+		if (item) {
+			[_tabs selectTabViewItem:item];
+		}
+		[self closeDocument:nil];
+	}
+	_suppressEmptyDocument = NO;
+	_closingWithoutPrompt = NO;
+	_cloneSource = nil;
+	_clonePane = NSNotFound;
+	_paneDocuments = [NSMutableArray arrayWithObject:[NSNull null]];
+	_paneTabs = [NSMutableArray arrayWithObject:[NSMutableArray array]];
+	_activePane = 0;
+	[_splitHost setPaneCount:1];
+	if (![self restoreSessionAtURL:url]) {
+		[self newDocument:nil];
+		[self alert:@"That session could not be opened."];
+	}
+	[self buildMenus];
+}
+
+- (void)restoreClone:(NSDictionary *)clone {
+	if (![clone isKindOfClass:[NSDictionary class]] || clone[@"document"] == nil) {
+		return;
+	}
+	NSInteger index = [clone[@"document"] integerValue];
+	NSInteger pane = [clone[@"pane"] integerValue];
+	if (index < 0 || index >= (NSInteger)_documents.count || pane < 0 || pane >= (NSInteger)_paneDocuments.count) {
+		return;
+	}
+	DocumentTab *document = _documents[index];
+	NSInteger source = [self paneIndexOfDocument:document];
+	if (source == NSNotFound || source == pane) {
+		return;
+	}
+	_cloneSource = document;
+	_clonePane = pane;
+	NSMutableArray *tabs = [self tabsForPane:pane];
+	if (tabs && ![tabs containsObject:document]) {
+		[tabs insertObject:document atIndex:0];
+	}
+	_paneDocuments[pane] = document;
+	[self placeEditor:document inPane:source];
+	[self placeEditor:document inPane:pane];
+	[self rebuildTabStrip];
+}
+
+- (void)insertEmptyPaneAt:(NSInteger)insert {
+	if (_paneDocuments.count >= 6 || insert < 0 || insert > (NSInteger)_paneDocuments.count) {
+		return;
+	}
+	NSMutableArray<NSNumber *> *fractions = [[_splitHost fractions] mutableCopy];
+	if (fractions.count != _paneDocuments.count) {
+		fractions = [NSMutableArray array];
+		CGFloat share = 1.0 / MAX(1, _paneDocuments.count);
+		for (NSInteger index = 0; index < (NSInteger)_paneDocuments.count; index++) {
+			[fractions addObject:@(share)];
+		}
+	}
+	NSInteger donor = insert > 0 ? insert - 1 : 0;
+	CGFloat half = fractions[donor].doubleValue / 2.0;
+	fractions[donor] = @(half);
+	[fractions insertObject:@(half) atIndex:insert];
+	[_paneDocuments insertObject:[NSNull null] atIndex:insert];
+	[_paneTabs insertObject:[NSMutableArray array] atIndex:insert];
+	[_splitHost setPaneCount:_paneDocuments.count];
+	[_splitHost setFractions:fractions];
+	if (insert <= _activePane) {
+		_activePane++;
+	}
+	[self relayoutPaneEditors];
+}
+
+- (void)focusClone {
+	if (!_cloneSource || _clonePane < 0 || _clonePane >= (NSInteger)_paneDocuments.count) {
+		return;
+	}
+	_activePane = _clonePane;
+	[_splitHost setActivePane:_clonePane];
+	[_tabs selectTabViewItem:[self itemForDocument:_cloneSource]];
+	[_window makeFirstResponder:[_cloneSource existingMirror]];
+	[self rebuildTabStrip];
+	[self refreshStatus];
+}
+
+- (void)dropClone {
+	if (!_cloneSource) {
+		return;
+	}
+	DocumentTab *source = _cloneSource;
+	NSInteger pane = _clonePane;
+	_cloneSource = nil;
+	_clonePane = NSNotFound;
+	[source discardMirror];
+	if (pane >= 0 && pane < (NSInteger)_paneTabs.count) {
+		NSMutableArray *tabs = _paneTabs[pane];
+		[tabs removeObject:source];
+		if (_paneDocuments[pane] == source) {
+			_paneDocuments[pane] = tabs.count ? tabs[0] : [NSNull null];
+		}
+		NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
+		[slot removeEditorViews];
+		id shown = _paneDocuments[pane];
+		if ([shown isKindOfClass:[DocumentTab class]]) {
+			[self placeEditor:shown inPane:pane];
+		}
+		if (tabs.count == 0 && _paneDocuments.count > 1) {
+			[self closeEmptyPane:pane];
+		}
+	}
+	[self rebuildTabStrip];
+	[self saveSession];
+}
+
+- (void)cloneBeside:(id)sender {
+	(void)sender;
+	DocumentTab *document = [self currentDocument];
+	if (!document) {
+		return;
+	}
+	if (_cloneSource == document && _clonePane != NSNotFound) {
+		[self focusClone];
+		return;
+	}
+	[self dropClone];
+	NSInteger source = [self paneIndexOfDocument:document];
+	if (source == NSNotFound) {
+		return;
+	}
+	NSInteger dest = source + 1;
+	if (dest >= (NSInteger)_paneDocuments.count) {
+		if (_paneDocuments.count >= 6) {
+			[self setStatusText:@"No room for another pane."];
+			return;
+		}
+		[self insertEmptyPaneAt:dest];
+	}
+	if (dest >= (NSInteger)_paneDocuments.count) {
+		return;
+	}
+	_cloneSource = document;
+	_clonePane = dest;
+	NSMutableArray<DocumentTab *> *tabs = [self tabsForPane:dest];
+	if (tabs && ![tabs containsObject:document]) {
+		[tabs insertObject:document atIndex:0];
+	}
+	_paneDocuments[dest] = document;
+	[self placeEditor:document inPane:source];
+	[self placeEditor:document inPane:dest];
+	[self focusClone];
+	[self saveSession];
+	[self setStatusText:@"The same file is open in both panes."];
+}
+
+- (void)togglePin:(id)sender {
+	(void)sender;
+	DocumentTab *document = [self currentDocument];
+	if (!document) {
+		return;
+	}
+	document.pinned = !document.pinned;
+	NSInteger pane = [self paneIndexOfDocument:document];
+	NSMutableArray<DocumentTab *> *tabs = [self tabsForPane:pane];
+	if (document.pinned && tabs && [tabs containsObject:document]) {
+		[tabs removeObject:document];
+		[tabs insertObject:document atIndex:0];
+	}
+	[self rebuildTabStrip];
+	[self saveSession];
+	[self setStatusText:document.pinned ? @"Tab pinned. Close All leaves it open." : @"Tab unpinned."];
+}
+
+- (BOOL)expandSnippet {
+	ScintillaView *editor = [self activeEditor];
+	if (!editor || [editor message:SCI_GETSELECTIONS] > 1) {
+		return NO;
+	}
+	long position = [editor message:SCI_GETCURRENTPOS];
+	long start = [editor message:SCI_WORDSTARTPOSITION wParam:(uptr_t)position lParam:1];
+	if (start >= position || position - start > 40) {
+		return NO;
+	}
+	long length = position - start;
+	std::string buffer(static_cast<size_t>(length) + 1, '\0');
+	Sci_TextRangeFull range;
+	range.chrg.cpMin = start;
+	range.chrg.cpMax = position;
+	range.lpstrText = buffer.data();
+	[editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	NSString *name = [[NSString alloc] initWithBytes:buffer.data() length:(NSUInteger)length encoding:NSUTF8StringEncoding];
+	NSString *body = [_snippets bodyForName:name];
+	if (!body) {
+		return NO;
+	}
+	[editor message:SCI_SETSEL wParam:(uptr_t)start lParam:(sptr_t)position];
+	const char *bytes = body.UTF8String ?: "";
+	[editor message:SCI_REPLACESEL wParam:0 lParam:(sptr_t)bytes];
+	return YES;
+}
+
+- (void)addNextOccurrence:(id)sender {
+	(void)sender;
+	ScintillaView *editor = [self activeEditor];
+	if (!editor) {
+		return;
+	}
+	long selStart = [editor message:SCI_GETSELECTIONSTART];
+	long selEnd = [editor message:SCI_GETSELECTIONEND];
+	if (selStart == selEnd) {
+		long position = [editor message:SCI_GETCURRENTPOS];
+		selStart = [editor message:SCI_WORDSTARTPOSITION wParam:(uptr_t)position lParam:1];
+		selEnd = [editor message:SCI_WORDENDPOSITION wParam:(uptr_t)position lParam:1];
+		if (selEnd <= selStart) {
+			return;
+		}
+		[editor message:SCI_SETSEL wParam:(uptr_t)selStart lParam:(sptr_t)selEnd];
+	}
+	long length = selEnd - selStart;
+	if (length <= 0 || length > 400) {
+		return;
+	}
+	std::string buffer(static_cast<size_t>(length) + 1, '\0');
+	Sci_TextRangeFull range;
+	range.chrg.cpMin = selStart;
+	range.chrg.cpMax = selEnd;
+	range.lpstrText = buffer.data();
+	[editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	long selections = [editor message:SCI_GETSELECTIONS];
+	long after = 0;
+	for (long index = 0; index < selections; index++) {
+		long end = [editor message:SCI_GETSELECTIONNEND wParam:(uptr_t)index lParam:0];
+		if (end > after) {
+			after = end;
+		}
+	}
+	long docLength = [editor message:SCI_GETLENGTH];
+	[editor message:SCI_SETSEARCHFLAGS wParam:SCFIND_MATCHCASE lParam:0];
+	[editor message:SCI_SETTARGETSTART wParam:(uptr_t)after lParam:0];
+	[editor message:SCI_SETTARGETEND wParam:(uptr_t)docLength lParam:0];
+	long found = [editor message:SCI_SEARCHINTARGET wParam:(uptr_t)length lParam:(sptr_t)buffer.data()];
+	if (found < 0) {
+		long first = [editor message:SCI_GETSELECTIONNSTART wParam:0 lParam:0];
+		[editor message:SCI_SETTARGETSTART wParam:0 lParam:0];
+		[editor message:SCI_SETTARGETEND wParam:(uptr_t)first lParam:0];
+		found = [editor message:SCI_SEARCHINTARGET wParam:(uptr_t)length lParam:(sptr_t)buffer.data()];
+	}
+	if (found < 0) {
+		return;
+	}
+	long targetStart = [editor message:SCI_GETTARGETSTART];
+	long targetEnd = [editor message:SCI_GETTARGETEND];
+	[editor message:SCI_ADDSELECTION wParam:(uptr_t)targetEnd lParam:(sptr_t)targetStart];
+	[editor message:SCI_SCROLLCARET];
+}
+
+- (NSEvent *)handleExtraCaretClick:(NSEvent *)event {
+	if (event.window != _window) {
+		return event;
+	}
+	NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+	BOOL command = (flags & NSEventModifierFlagCommand) != 0;
+	BOOL other = (flags & (NSEventModifierFlagOption | NSEventModifierFlagShift | NSEventModifierFlagControl)) != 0;
+	if (!command || other) {
+		return event;
+	}
+	NSView *hit = [_window.contentView hitTest:event.locationInWindow];
+	ScintillaView *editor = nil;
+	BOOL inContent = NO;
+	for (NSView *view = hit; view; view = view.superview) {
+		if ([NSStringFromClass(view.class) isEqualToString:@"SCIContentView"]) {
+			inContent = YES;
+		}
+		if ([view isKindOfClass:[ScintillaView class]]) {
+			editor = (ScintillaView *)view;
+			break;
+		}
+	}
+	if (!editor || !inContent) {
+		return event;
+	}
+	NSView *content = hit;
+	while (content && ![NSStringFromClass(content.class) isEqualToString:@"SCIContentView"]) {
+		content = content.superview;
+	}
+	NSPoint local = [(content ?: editor) convertPoint:event.locationInWindow fromView:nil];
+	long position = [editor message:SCI_CHARPOSITIONFROMPOINTCLOSE wParam:(uptr_t)MAX(0, (int)local.x) lParam:(sptr_t)MAX(0, (int)local.y)];
+	if (position < 0) {
+		return event;
+	}
+	[editor message:SCI_ADDSELECTION wParam:(uptr_t)position lParam:(sptr_t)position];
+	[_window makeFirstResponder:editor];
+	return nil;
+}
+
+- (void)showSidebarPage:(NSInteger)page {
+	_sidebarPage = page;
+	_workspace.sidebarVisible = YES;
+	NSButton *button = [_sidebar viewWithTag:5];
+	NSString *toggleSymbol = page == 1 ? @"folder" : @"list.bullet.indent";
+	NSImage *toggleImage = [NSImage imageWithSystemSymbolName:toggleSymbol accessibilityDescription:page == 1 ? @"Folder" : @"Symbols"];
+	toggleImage.size = NSMakeSize(13, 13);
+	button.image = toggleImage;
+	button.title = @"";
+	button.toolTip = page == 1 ? NppL(@"Folder") : NppL(@"Symbols");
+	NSImageView *glyph = [_sidebar viewWithTag:6];
+	glyph.image = page == 1
+		? NppTintedSymbol(@"list.bullet.indent", NSColor.controlAccentColor)
+		: NppTintedSymbol(@"folder.fill", NSColor.systemBlueColor);
+	NSTextField *title = [_sidebar viewWithTag:1];
+	if (page == 1) {
+		title.stringValue = NppL(@"Outline");
+	} else if (_folderRoot.lastPathComponent.length) {
+		title.stringValue = _folderRoot.lastPathComponent;
+	} else {
+		title.stringValue = NppL(@"Folder");
+	}
+	[_workspace layoutPanes];
+	[self layoutFolderSidebar];
+	if (page == 1) {
+		[self reloadOutline];
+	}
+}
+
+- (void)showOutline:(id)sender {
+	(void)sender;
+	if (_sidebarPage == 1 && _workspace.sidebarVisible) {
+		if (_folderRoot.length) {
+			[self showSidebarPage:0];
+		} else {
+			_workspace.sidebarVisible = NO;
+			[_workspace layoutPanes];
+		}
+		return;
+	}
+	[self showSidebarPage:1];
+}
+
+- (void)toggleFolderSidebar:(id)sender {
+	(void)sender;
+	if (_workspace.sidebarVisible && _sidebarPage == 0) {
+		[self closeFolderSidebar:nil];
+		return;
+	}
+	if (_folderRoot.length == 0) {
+		[self openFolder:nil];
+		return;
+	}
+	[self showSidebarPage:0];
+}
+
+- (void)reloadOutline {
+	DocumentTab *document = [self currentDocument];
+	_outlineRows = document ? NppOutlineSymbols(document.language, document.lexerName, [document utf8Text] ?: @"") : @[];
+	[_outlineTable reloadData];
+}
+
+- (void)openOutlineRow:(id)sender {
+	(void)sender;
+	NSInteger row = _outlineTable.clickedRow;
+	if (row < 0) {
+		row = _outlineTable.selectedRow;
+	}
+	if (row < 0 || row >= (NSInteger)_outlineRows.count) {
+		return;
+	}
+	ScintillaView *editor = [self activeEditor];
+	long line = _outlineRows[row].line - 1;
+	[editor message:SCI_GOTOLINE wParam:(uptr_t)MAX(0, line) lParam:0];
+	[editor message:SCI_SCROLLCARET];
+	[_window makeFirstResponder:editor];
+}
+
+- (NppMinimapView *)minimapForSlot:(NppPaneSlot *)slot pane:(NSInteger)pane {
+	NppMinimapView *map = nil;
+	for (NSView *view in slot.subviews) {
+		if ([view isKindOfClass:[NppMinimapView class]]) {
+			map = (NppMinimapView *)view;
+			break;
+		}
+	}
+	if (!map) {
+		map = [[NppMinimapView alloc] initWithFrame:NSZeroRect];
+		map.identifier = @"npp.minimap";
+		map.target = self;
+		map.action = @selector(minimapJump:);
+		[slot addSubview:map];
+	}
+	map.hoverAction = @selector(minimapHover:);
+	map.pane = pane;
+	map.hidden = !_settings.showMinimap;
+	return map;
+}
+
+- (void)attachMinimapToSlot:(NppPaneSlot *)slot forDocument:(DocumentTab *)document {
+	(void)document;
+	[self minimapForSlot:slot pane:slot.paneIndex];
+}
+
+- (void)updateMinimapViewport:(DocumentTab *)document {
+	NSInteger pane = [self paneIndexOfDocument:document];
+	if (document == _cloneSource && _activePane == _clonePane) {
+		pane = _clonePane;
+	}
+	if (pane == NSNotFound) {
+		return;
+	}
+	NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
+	NppMinimapView *map = nil;
+	for (NSView *view in slot.subviews) {
+		if ([view isKindOfClass:[NppMinimapView class]]) {
+			map = (NppMinimapView *)view;
+			break;
+		}
+	}
+	if (!map || map.hidden) {
+		return;
+	}
+	ScintillaView *editor = [self editorForDocument:document inPane:pane];
+	long lines = MAX(1, [editor message:SCI_GETLINECOUNT]);
+	long first = [editor message:SCI_GETFIRSTVISIBLELINE];
+	long visible = MAX(1, [editor message:SCI_LINESONSCREEN]);
+	map.viewportStart = (CGFloat)first / (CGFloat)lines;
+	map.viewportScale = (CGFloat)visible / (CGFloat)lines;
+	[map setNeedsDisplay:YES];
+}
+
+- (void)refreshMinimapForDocument:(DocumentTab *)document inPane:(NSInteger)pane {
+	NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
+	if (![slot isKindOfClass:[NppPaneSlot class]]) {
+		return;
+	}
+	NppMinimapView *map = [self minimapForSlot:slot pane:pane];
+	if (map.hidden) {
+		[slot layoutContents];
+		return;
+	}
+	ScintillaView *editor = [self editorForDocument:document inPane:pane];
+	long lines = MAX(1, [editor message:SCI_GETLINECOUNT]);
+	NSInteger step = MAX(1, (NSInteger)lines / 400);
+	NSMutableArray<NSNumber *> *widths = [NSMutableArray array];
+	for (long line = 0; line < lines; line += step) {
+		long length = [editor message:SCI_LINELENGTH wParam:(uptr_t)line lParam:0];
+		[widths addObject:@(MIN(180, MAX(0, length)))];
+	}
+	map.lineWidths = widths;
+	long first = [editor message:SCI_GETFIRSTVISIBLELINE];
+	long visible = MAX(1, [editor message:SCI_LINESONSCREEN]);
+	map.viewportStart = (CGFloat)first / (CGFloat)lines;
+	map.viewportScale = (CGFloat)visible / (CGFloat)lines;
+	[map setNeedsDisplay:YES];
+	[slot layoutContents];
+}
+
+- (NSRect)zoomCardScreenRect {
+	if (!_zoomCard || _zoomCard.hidden || !_zoomCard.window) {
+		return NSZeroRect;
+	}
+	return [_zoomCard.window convertRectToScreen:[_zoomCard convertRect:_zoomCard.bounds toView:nil]];
+}
+
+- (BOOL)mouseIsOverZoomPanel {
+	NSRect card = NSInsetRect([self zoomCardScreenRect], -28, -28);
+	if (!NSIsEmptyRect(card) && NSPointInRect(NSEvent.mouseLocation, card)) {
+		return YES;
+	}
+	if (_zoomMap && !_zoomMap.hidden && _zoomMap.window) {
+		NSRect map = [_zoomMap.window convertRectToScreen:[_zoomMap convertRect:_zoomMap.bounds toView:nil]];
+		if (NSPointInRect(NSEvent.mouseLocation, NSInsetRect(map, -12, -12))) {
+			return YES;
+		}
+	}
+	return NO;
+}
+
+- (void)scheduleZoomHide {
+	NSInteger token = ++_zoomHideGeneration;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		if (token != self->_zoomHideGeneration || [self mouseIsOverZoomPanel]) {
+			return;
+		}
+		[self hideZoomPanel];
+	});
+}
+
+- (void)hideZoomPanel {
+	++_zoomHideGeneration;
+	[_zoomPanel orderOut:nil];
+	_zoomCard.hidden = YES;
+	[_zoomCard removeFromSuperview];
+	_zoomMap = nil;
+}
+
+- (NppMinimapZoom *)zoomCard {
+	if (_zoomCard) {
+		return _zoomCard;
+	}
+	_zoomCard = [[NppMinimapZoom alloc] initWithFrame:NSMakeRect(0, 0, 240, 200)];
+	_zoomCard.identifier = @"npp.minimapZoom";
+	_zoomCard.translatesAutoresizingMaskIntoConstraints = YES;
+	_zoomCard.autoresizingMask = NSViewNotSizable;
+	_zoomCard.wantsLayer = YES;
+	_zoomCard.layer.shadowColor = NSColor.blackColor.CGColor;
+	_zoomCard.layer.shadowOpacity = 0.28f;
+	_zoomCard.layer.shadowRadius = 10;
+	_zoomCard.layer.shadowOffset = CGSizeMake(0, -1);
+	_zoomCard.target = self;
+	_zoomCard.action = @selector(minimapZoomJump:);
+	_zoomCard.exitAction = @selector(minimapZoomExited:);
+	_zoomCard.clickedLine = -1;
+	if (!_zoomClickMonitor) {
+		__weak AppDelegate *weakSelf = self;
+		_zoomClickMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown handler:^NSEvent *(NSEvent *event) {
+			AppDelegate *strongSelf = weakSelf;
+			return strongSelf ? [strongSelf zoomClickEvent:event] : event;
+		}];
+	}
+	return _zoomCard;
+}
+
+- (NSEvent *)zoomClickEvent:(NSEvent *)event {
+	if (event.window != _window || !_zoomCard.superview || _zoomCard.hidden || _zoomCard.rowNumbers.count == 0) {
+		return event;
+	}
+	NSPoint inContent = [_zoomCard.superview convertPoint:event.locationInWindow fromView:nil];
+	if (!NSPointInRect(inContent, _zoomCard.frame)) {
+		return event;
+	}
+	[_zoomCard clickAtViewPoint:[_zoomCard convertPoint:event.locationInWindow fromView:nil]];
+	return nil;
+}
+
+- (void)minimapHover:(NppMinimapView *)sender {
+	NppPaneSlot *slot = [sender.superview isKindOfClass:[NppPaneSlot class]] ? (NppPaneSlot *)sender.superview : nil;
+	if (!slot) {
+		return;
+	}
+	if (!sender.hovering || sender.hidden) {
+		[self scheduleZoomHide];
+		return;
+	}
+	++_zoomHideGeneration;
+	NSInteger pane = sender.pane;
+	id shown = (pane >= 0 && pane < (NSInteger)_paneDocuments.count) ? _paneDocuments[pane] : nil;
+	DocumentTab *document = [shown isKindOfClass:[DocumentTab class]] ? shown : [self currentDocument];
+	ScintillaView *editor = document ? [self editorForDocument:document inPane:pane] : nil;
+	if (!editor) {
+		[self hideZoomPanel];
+		return;
+	}
+	long lineCount = MAX(1, [editor message:SCI_GETLINECOUNT]);
+	long focus = MIN(lineCount - 1, MAX(0, (long)(sender.hoverFraction * lineCount)));
+	NSInteger capacity = MIN(18, MAX(5, (NSInteger)((NSHeight(sender.frame) - 16) / 17)));
+	long startLine = MAX(0, focus - capacity / 2);
+	long endLine = MIN(lineCount, startLine + capacity);
+	startLine = MAX(0, endLine - capacity);
+	NSMutableArray<NSString *> *rows = [NSMutableArray array];
+	NSMutableArray<NSNumber *> *numbers = [NSMutableArray array];
+	NSFont *font = [NSFont fontWithName:@"Menlo" size:12] ?: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
+	CGFloat textWidth = 80;
+	for (long line = startLine; line < endLine; line++) {
+		NSString *text = NppZoomLine(editor, line);
+		[rows addObject:text];
+		[numbers addObject:@(line + 1)];
+		textWidth = MAX(textWidth, ceil([text sizeWithAttributes:@{NSFontAttributeName: font}].width));
+	}
+	CGFloat available = NSMinX(sender.frame) - 16;
+	if (available < 140) {
+		[self hideZoomPanel];
+		return;
+	}
+	NppMinimapZoom *zoom = [self zoomCard];
+	zoom.pane = pane;
+	_zoomMap = sender;
+	zoom.rows = rows;
+	zoom.rowNumbers = numbers;
+	zoom.focusLine = focus + 1;
+	CGFloat width = MIN(textWidth + 74, available);
+	width = MAX(180, MIN(width, available));
+	CGFloat height = rows.count * 17 + 16;
+	CGFloat focusIndex = focus - startLine;
+	CGFloat focusCenter = 8 + focusIndex * 17 + 8.5;
+	NSRect mapInWindow = [sender convertRect:sender.bounds toView:nil];
+	NSView *content = _window.contentView;
+	NSRect mapInContent = [content convertRect:mapInWindow fromView:nil];
+	NSPoint mouseInContent = [content convertPoint:[_window convertPointFromScreen:NSEvent.mouseLocation] fromView:nil];
+	CGFloat x = NSMinX(mapInContent) - width + 10;
+	CGFloat y = mouseInContent.y - height + focusCenter;
+	NSRect bounds = content.bounds;
+	x = MIN(MAX(NSMinX(bounds) + 8, x), NSMaxX(bounds) - width - 8);
+	y = MIN(MAX(NSMinY(bounds) + 8, y), NSMaxY(bounds) - height - 8);
+	zoom.hidden = NO;
+	zoom.frame = NSMakeRect(x, y, width, height);
+	zoom.layer.zPosition = 1000;
+	[content addSubview:zoom positioned:NSWindowAbove relativeTo:nil];
+	[zoom setNeedsDisplay:YES];
+}
+
+- (void)hideMinimapZoomInSlot:(NSView *)slot {
+	(void)slot;
+	[self hideZoomPanel];
+}
+
+- (void)placeCaretInEditor:(ScintillaView *)editor line:(long)line column:(long)column {
+	if (!editor) {
+		return;
+	}
+	long lines = MAX(1, [editor message:SCI_GETLINECOUNT]);
+	line = MIN(lines - 1, MAX(0, line));
+	[editor message:SCI_ENSUREVISIBLE wParam:(uptr_t)line lParam:0];
+	[editor message:SCI_GOTOLINE wParam:(uptr_t)line lParam:0];
+	long pos = column < 0 ? [editor message:SCI_GETLINEENDPOSITION wParam:(uptr_t)line lParam:0] : NppZoomColumnPosition(editor, line, column);
+	[editor message:SCI_GOTOPOS wParam:(uptr_t)pos lParam:0];
+	[editor message:SCI_SETEMPTYSELECTION wParam:(uptr_t)pos lParam:0];
+	[self revealLine:line position:pos inEditor:editor];
+	[self focusEditorForTyping:editor position:pos];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[self hideZoomPanel];
+		[self revealLine:line position:pos inEditor:editor];
+		[self focusEditorForTyping:editor position:pos];
+	});
+}
+
+- (void)focusEditorForTyping:(ScintillaView *)editor position:(long)pos {
+	if (!editor) {
+		return;
+	}
+	[editor message:SCI_SETEMPTYSELECTION wParam:(uptr_t)pos lParam:0];
+	[editor message:SCI_SCROLLCARET];
+	NSView *typing = editor.content ?: editor;
+	[_window makeKeyAndOrderFront:nil];
+	[_window makeFirstResponder:typing];
+	[editor message:SCI_SETFOCUS wParam:1 lParam:0];
+	_statusOverride = nil;
+	[self refreshStatus];
+}
+
+- (ScintillaView *)visibleEditorInPane:(NSInteger)pane document:(DocumentTab *)document {
+	NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
+	if ([slot isKindOfClass:[NppPaneSlot class]]) {
+		for (NSView *subview in slot.subviews) {
+			if ([subview isKindOfClass:[ScintillaView class]] && subview.window) {
+				return (ScintillaView *)subview;
+			}
+		}
+	}
+	return document ? [self editorForDocument:document inPane:pane] : nil;
+}
+
+- (void)revealLine:(long)line position:(long)pos inEditor:(ScintillaView *)editor {
+	if (!editor) {
+		return;
+	}
+	long displayLine = [editor message:SCI_VISIBLEFROMDOCLINE wParam:(uptr_t)line lParam:0];
+	long page = MAX(1, [editor message:SCI_LINESONSCREEN]);
+	long top = MAX(0, displayLine - MAX(1, page / 3));
+	[editor message:SCI_SETFIRSTVISIBLELINE wParam:(uptr_t)top lParam:0];
+	NSScrollView *scroll = editor.scrollView;
+	NSClipView *clip = scroll.contentView;
+	if (!clip) {
+		return;
+	}
+	CGFloat lineHeight = MAX(1.0, (CGFloat)[editor message:SCI_TEXTHEIGHT wParam:(uptr_t)MAX(0, line) lParam:0]);
+	const char *sample = "0";
+	CGFloat charWidth = MAX(1.0, (CGFloat)[editor message:SCI_TEXTWIDTH wParam:STYLE_DEFAULT lParam:(sptr_t)sample]);
+	long caretColumn = [editor message:SCI_GETCOLUMN wParam:(uptr_t)pos lParam:0];
+	CGFloat x = MAX(0, caretColumn * charWidth - 80);
+	CGFloat y = MAX(0, top * lineHeight);
+	[clip scrollToPoint:NSMakePoint(x, y)];
+	[scroll reflectScrolledClipView:clip];
+	[editor setNeedsDisplay:YES];
+}
+
+- (void)minimapZoomExited:(NppMinimapZoom *)sender {
+	(void)sender;
+	[self scheduleZoomHide];
+}
+
+- (void)minimapZoomJump:(NppMinimapZoom *)sender {
+	long line = sender.clickedLine;
+	long column = sender.clickedColumn;
+	sender.clickedLine = -1;
+	NSInteger pane = sender.pane;
+	id shown = (pane >= 0 && pane < (NSInteger)_paneDocuments.count) ? _paneDocuments[pane] : nil;
+	DocumentTab *document = [shown isKindOfClass:[DocumentTab class]] ? shown : [self currentDocument];
+	ScintillaView *editor = [self visibleEditorInPane:pane document:document];
+	[self placeCaretInEditor:editor line:line column:column];
+}
+
+- (void)minimapJump:(NppMinimapView *)sender {
+	NSInteger pane = sender.pane;
+	id shown = (pane >= 0 && pane < (NSInteger)_paneDocuments.count) ? _paneDocuments[pane] : nil;
+	DocumentTab *document = [shown isKindOfClass:[DocumentTab class]] ? shown : [self currentDocument];
+	if (!document) {
+		return;
+	}
+	ScintillaView *editor = [self visibleEditorInPane:pane document:document];
+	long lines = MAX(1, [editor message:SCI_GETLINECOUNT]);
+	long line = MIN(lines - 1, MAX(0, (long)(sender.clickedFraction * lines)));
+	[self placeCaretInEditor:editor line:line column:0];
+	[self hideMinimapZoomInSlot:sender.superview];
+}
+
+- (void)toggleMinimap:(id)sender {
+	(void)sender;
+	_settings.showMinimap = !_settings.showMinimap;
+	NSError *error = nil;
+	[_settings saveToURL:[SupportDirectory() URLByAppendingPathComponent:@"settings.json"] error:&error];
+	[self hideZoomPanel];
+	for (NSInteger pane = 0; pane < [_splitHost paneCount]; pane++) {
+		NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:pane];
+		for (NSView *view in slot.subviews) {
+			if ([view.identifier isEqualToString:@"npp.minimap"]) {
+				view.hidden = !_settings.showMinimap;
+			}
+			if ([view.identifier isEqualToString:@"npp.minimapZoom"]) {
+				view.hidden = YES;
+			}
+		}
+		[slot layoutContents];
+	}
+	[self buildMenus];
+	[self refreshLivePanels];
+}
+
+- (void)attachPreviewToSlot:(NppPaneSlot *)slot {
+	if (!_preview) {
+		_preview = [[WKWebView alloc] initWithFrame:NSZeroRect];
+		_preview.identifier = @"npp.preview";
+		_preview.allowsMagnification = YES;
+	}
+	_preview.hidden = !_previewVisible;
+	if (_preview.superview != slot) {
+		[_preview removeFromSuperview];
+		[slot addSubview:_preview];
+	}
+}
+
+- (void)reloadPreview {
+	if (!_previewVisible) {
+		return;
+	}
+	DocumentTab *document = [self currentDocument];
+	NppPaneSlot *slot = (NppPaneSlot *)[_splitHost slotAtIndex:_activePane];
+	if ([slot isKindOfClass:[NppPaneSlot class]]) {
+		[self attachPreviewToSlot:slot];
+		[slot layoutContents];
+	}
+	NSString *html = NppPreviewHTML([document utf8Text] ?: @"", document.language, document.lexerName, [self darkAppearance]);
+	[_preview loadHTMLString:html baseURL:nil];
+}
+
+- (void)togglePreview:(id)sender {
+	(void)sender;
+	_previewVisible = !_previewVisible;
+	if (!_previewVisible && _preview.superview) {
+		_preview.hidden = YES;
+		[_preview.superview setNeedsLayout:YES];
+		if ([_preview.superview isKindOfClass:[NppPaneSlot class]]) {
+			[(NppPaneSlot *)_preview.superview layoutContents];
+		}
+	}
+	[self buildMenus];
+	[self reloadPreview];
+}
+
+- (void)refreshLivePanels {
+	if (_sidebarPage == 1 && _workspace.sidebarVisible) {
+		[self reloadOutline];
+	}
+	for (NSInteger pane = 0; pane < (NSInteger)_paneDocuments.count; pane++) {
+		id shown = _paneDocuments[pane];
+		if ([shown isKindOfClass:[DocumentTab class]]) {
+			[self refreshMinimapForDocument:shown inPane:pane];
+		}
+	}
+	if (_previewVisible) {
+		[self reloadPreview];
+	}
+}
+
+- (void)showClipboardHistory:(id)sender {
+	(void)sender;
+	if (!_clipboardWindow) {
+		_clipboardWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 320) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
+		_clipboardWindow.title = @"Clipboard History";
+		_clipboardWindow.releasedWhenClosed = NO;
+		NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 420, 320)];
+		scroll.hasVerticalScroller = YES;
+		scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+		_clipboardTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+		NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"text"];
+		column.title = @"Copied text";
+		column.width = 380;
+		[_clipboardTable addTableColumn:column];
+		_clipboardTable.dataSource = self;
+		_clipboardTable.delegate = self;
+		_clipboardTable.target = self;
+		_clipboardTable.doubleAction = @selector(pasteClipboardRow:);
+		scroll.documentView = _clipboardTable;
+		[_clipboardWindow.contentView addSubview:scroll];
+	}
+	[_clipboardTable reloadData];
+	[_clipboardWindow center];
+	[_clipboardWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)pasteClipboardRow:(id)sender {
+	(void)sender;
+	NSInteger row = _clipboardTable.clickedRow >= 0 ? _clipboardTable.clickedRow : _clipboardTable.selectedRow;
+	if (row < 0 || row >= (NSInteger)_clips.items.count) {
+		return;
+	}
+	const char *bytes = _clips.items[row].UTF8String ?: "";
+	[[self activeEditor] message:SCI_REPLACESEL wParam:0 lParam:(sptr_t)bytes];
+	[_clipboardWindow close];
+	[_window makeFirstResponder:[self activeEditor]];
+}
+
+- (void)showSnippets:(id)sender {
+	(void)sender;
+	if (!_snippetWindow) {
+		_snippetWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 520, 360) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
+		_snippetWindow.title = @"Snippets";
+		_snippetWindow.releasedWhenClosed = NO;
+		NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 52, 496, 280)];
+		scroll.hasVerticalScroller = YES;
+		scroll.borderType = NSBezelBorder;
+		_snippetTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+		for (NSArray *info in @[@[@"name", @"Name", @140], @[@"body", @"Text", @320]]) {
+			NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:info[0]];
+			column.title = info[1];
+			column.width = [info[2] doubleValue];
+			column.editable = YES;
+			[_snippetTable addTableColumn:column];
+		}
+		_snippetTable.dataSource = self;
+		_snippetTable.delegate = self;
+		scroll.documentView = _snippetTable;
+		NSButton *add = [self button:@"Add" action:@selector(addSnippet:) frame:NSMakeRect(12, 14, 80, 28)];
+		NSButton *remove = [self button:@"Remove" action:@selector(removeSnippet:) frame:NSMakeRect(100, 14, 90, 28)];
+		NSButton *save = [self button:@"Save" action:@selector(saveSnippets:) frame:NSMakeRect(420, 14, 88, 28)];
+		[_snippetWindow.contentView addSubview:scroll];
+		for (NSView *view in @[add, remove, save]) {
+			[_snippetWindow.contentView addSubview:view];
+		}
+	}
+	[_snippetTable reloadData];
+	[_snippetWindow center];
+	[_snippetWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)addSnippet:(id)sender {
+	(void)sender;
+	[_snippets.snippets addObject:[@{@"name": @"snippet", @"body": @""} mutableCopy]];
+	[_snippetTable reloadData];
+}
+
+- (void)removeSnippet:(id)sender {
+	(void)sender;
+	NSInteger row = _snippetTable.selectedRow;
+	if (row >= 0 && row < (NSInteger)_snippets.snippets.count) {
+		[_snippets.snippets removeObjectAtIndex:row];
+		[_snippetTable reloadData];
+	}
+}
+
+- (void)saveSnippets:(id)sender {
+	(void)sender;
+	NSError *error = nil;
+	[_snippets saveToURL:[SupportDirectory() URLByAppendingPathComponent:@"snippets.json"] error:&error];
+	[self setStatusText:@"Snippets saved. Press Tab after a snippet name to insert it."];
+	[_snippetWindow close];
+}
+
+- (void)chooseUserLanguage:(NSMenuItem *)sender {
+	DocumentTab *document = [self currentDocument];
+	LangInfo *info = [_userLanguages langInfoNamed:sender.representedObject];
+	if (!document || !info) {
+		return;
+	}
+	document.manualLanguage = YES;
+	[document applyLanguage:info dark:[self darkAppearance]];
+}
+
+- (void)showUserLanguages:(id)sender {
+	(void)sender;
+	if (!_languageWindow) {
+		_languageWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 640, 360) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
+		_languageWindow.title = @"User Languages";
+		_languageWindow.releasedWhenClosed = NO;
+		NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 52, 616, 280)];
+		scroll.hasVerticalScroller = YES;
+		scroll.borderType = NSBezelBorder;
+		_languageTable = [[NSTableView alloc] initWithFrame:NSZeroRect];
+		for (NSArray *info in @[@[@"name", @"Name", @120], @[@"extensions", @"Extensions", @140], @[@"keywords", @"Keywords", @240], @[@"lexer", @"Lexer", @80]]) {
+			NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:info[0]];
+			column.title = info[1];
+			column.width = [info[2] doubleValue];
+			column.editable = YES;
+			[_languageTable addTableColumn:column];
+		}
+		_languageTable.dataSource = self;
+		_languageTable.delegate = self;
+		scroll.documentView = _languageTable;
+		NSButton *add = [self button:@"Add" action:@selector(addUserLanguage:) frame:NSMakeRect(12, 14, 80, 28)];
+		NSButton *remove = [self button:@"Remove" action:@selector(removeUserLanguage:) frame:NSMakeRect(100, 14, 90, 28)];
+		NSButton *save = [self button:@"Save" action:@selector(saveUserLanguages:) frame:NSMakeRect(528, 14, 100, 28)];
+		[_languageWindow.contentView addSubview:scroll];
+		for (NSView *view in @[add, remove, save]) {
+			[_languageWindow.contentView addSubview:view];
+		}
+	}
+	[_languageTable reloadData];
+	[_languageWindow center];
+	[_languageWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)addUserLanguage:(id)sender {
+	(void)sender;
+	NppUserLanguage *language = [NppUserLanguage new];
+	language.name = @"My Language";
+	language.extensions = @"mylang";
+	language.keywords = @"";
+	language.lexer = @"cpp";
+	[_userLanguages.languages addObject:language];
+	[_languageTable reloadData];
+}
+
+- (void)removeUserLanguage:(id)sender {
+	(void)sender;
+	NSInteger row = _languageTable.selectedRow;
+	if (row >= 0 && row < (NSInteger)_userLanguages.languages.count) {
+		[_userLanguages.languages removeObjectAtIndex:row];
+		[_languageTable reloadData];
+	}
+}
+
+- (void)saveUserLanguages:(id)sender {
+	(void)sender;
+	NSError *error = nil;
+	[_userLanguages saveToURL:[SupportDirectory() URLByAppendingPathComponent:@"languages.json"] error:&error];
+	[self buildMenus];
+	[self setStatusText:@"User languages saved. Matching extensions use them when a file opens."];
+	[_languageWindow close];
+}
+
+- (void)tableView:(NSTableView *)tableView setObjectValue:(id)object forTableColumn:(NSTableColumn *)column row:(NSInteger)row {
+	NSString *value = [object isKindOfClass:[NSString class]] ? object : @"";
+	if (tableView == _shortcutTable && row >= 0 && row < (NSInteger)_shortcutRows.count && [column.identifier isEqualToString:@"keys"]) {
+		_shortcutRows[row][@"keys"] = value;
+	} else if (tableView == _snippetTable && row >= 0 && row < (NSInteger)_snippets.snippets.count) {
+		_snippets.snippets[row][column.identifier] = value;
+	} else if (tableView == _languageTable && row >= 0 && row < (NSInteger)_userLanguages.languages.count) {
+		NppUserLanguage *language = _userLanguages.languages[row];
+		if ([column.identifier isEqualToString:@"extensions"]) language.extensions = value;
+		else if ([column.identifier isEqualToString:@"keywords"]) language.keywords = value;
+		else if ([column.identifier isEqualToString:@"lexer"]) language.lexer = value;
+		else language.name = value.length ? value : language.name;
+	}
 }
 
 @end

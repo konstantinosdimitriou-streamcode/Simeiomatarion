@@ -1,4 +1,4 @@
-# Notepad++ 8.9.8.1 for Apple Silicon
+# Simeiomatarion
 
 Native arm64 macOS application. It is a GPL-3 derivative of [Notepad++ 8.9.8.1](https://notepad-plus-plus.org/downloads/v8.9.8.1/). The official source is in `../upstream` (tag `v8.9.8.1`, commit `dd40fe45598791e9aa38f3aeb200e10fb3d6338a`).
 
@@ -13,13 +13,13 @@ Run this from any directory. The project path contains spaces, so keep the quote
 ```sh
 cd "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos"
 ./build.sh
-open "build/Notepad++.app"
+open "build/Simeiomatarion.app"
 ```
 
 Or, without rebuilding:
 
 ```sh
-open "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos/build/Notepad++.app"
+open "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos/build/Simeiomatarion.app"
 ```
 
 `make test` also runs `build/port_tests`.
