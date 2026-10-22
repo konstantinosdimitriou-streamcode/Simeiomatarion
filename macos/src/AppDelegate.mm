@@ -2341,14 +2341,24 @@ static void HostStatus(NppMacHost *host, const char *text) {
 	for (DocumentTab *document in _documents) {
 		BOOL gather = split && [self paneIndexOfDocument:document] != NSNotFound;
 		ScintillaView *editor = document.editor;
-		if (gather || _settings.wrap) {
-			[editor message:SCI_SETWRAPMODE wParam:gather ? SC_WRAP_CHAR : SC_WRAP_WORD lParam:0];
-			[editor message:SCI_SETSCROLLWIDTHTRACKING wParam:0 lParam:0];
+		if (!editor) {
+			continue;
+		}
+		int wrapMode = (gather || _settings.wrap) ? (gather ? SC_WRAP_CHAR : SC_WRAP_WORD) : SC_WRAP_NONE;
+		BOOL track = wrapMode == SC_WRAP_NONE;
+		if ([editor message:SCI_GETWRAPMODE] != wrapMode) {
+			[editor message:SCI_SETWRAPMODE wParam:(uptr_t)wrapMode lParam:0];
+		}
+		if (([editor message:SCI_GETSCROLLWIDTHTRACKING] != 0) != track) {
+			[editor message:SCI_SETSCROLLWIDTHTRACKING wParam:track ? 1 : 0 lParam:0];
+		}
+		long width = [editor message:SCI_GETSCROLLWIDTH];
+		if (track) {
+			if (width < 2000) {
+				[editor message:SCI_SETSCROLLWIDTH wParam:2000 lParam:0];
+			}
+		} else if (width != 1) {
 			[editor message:SCI_SETSCROLLWIDTH wParam:1 lParam:0];
-		} else {
-			[editor message:SCI_SETWRAPMODE wParam:SC_WRAP_NONE lParam:0];
-			[editor message:SCI_SETSCROLLWIDTHTRACKING wParam:1 lParam:0];
-			[editor message:SCI_SETSCROLLWIDTH wParam:2000 lParam:0];
 		}
 	}
 }
@@ -5301,36 +5311,68 @@ static NSString *NppMenuSymbol(NSString *title) {
 		[_clipboardTable reloadData];
 	}
 }
-- (void)undo:(id)sender { (void)sender; [[self activeEditor] message:SCI_UNDO]; }
-- (void)redo:(id)sender { (void)sender; [[self activeEditor] message:SCI_REDO]; }
-- (void)cut:(id)sender { (void)sender; [[self activeEditor] message:SCI_CUT]; [self rememberClipboardText]; }
+- (id)focusedText {
+	id responder = _window.firstResponder;
+	return [responder isKindOfClass:[NSText class]] ? responder : nil;
+}
+- (void)undo:(id)sender {
+	id text = [self focusedText];
+	if (text) {
+		[text undo:sender];
+		return;
+	}
+	[[self activeEditor] message:SCI_UNDO];
+}
+- (void)redo:(id)sender {
+	id text = [self focusedText];
+	if (text) {
+		[text redo:sender];
+		return;
+	}
+	[[self activeEditor] message:SCI_REDO];
+}
+- (void)cut:(id)sender {
+	id text = [self focusedText];
+	if (text) {
+		[text cut:sender];
+		[self rememberClipboardText];
+		return;
+	}
+	[[self activeEditor] message:SCI_CUT];
+	[self rememberClipboardText];
+}
 - (void)copy:(id)sender {
-	(void)sender;
+	id text = [self focusedText];
+	if (text) {
+		[text copy:sender];
+		[self rememberClipboardText];
+		return;
+	}
 	NSView *surface = [self officeShowsSurface:[self currentDocument]] ? [self officeRefForDocument:[self currentDocument]].view : nil;
 	if (surface && [self officeRefForDocument:[self currentDocument]].kind == NppOfficeKindPDF) {
 		[NSApp sendAction:@selector(copy:) to:surface from:sender];
 		return;
 	}
-	id responder = _window.firstResponder;
-	if ([responder isKindOfClass:[NSText class]]) {
-		[responder copy:sender];
-		[self rememberClipboardText];
-		return;
-	}
 	[[self activeEditor] message:SCI_COPY];
 	[self rememberClipboardText];
 }
-- (void)paste:(id)sender { (void)sender; [[self activeEditor] message:SCI_PASTE]; }
+- (void)paste:(id)sender {
+	id text = [self focusedText];
+	if (text) {
+		[text paste:sender];
+		return;
+	}
+	[[self activeEditor] message:SCI_PASTE];
+}
 - (void)selectAll:(id)sender {
-	(void)sender;
+	id text = [self focusedText];
+	if (text) {
+		[text selectAll:sender];
+		return;
+	}
 	NSView *surface = [self officeShowsSurface:[self currentDocument]] ? [self officeRefForDocument:[self currentDocument]].view : nil;
 	if (surface && [self officeRefForDocument:[self currentDocument]].kind == NppOfficeKindPDF) {
 		[NSApp sendAction:@selector(selectAll:) to:surface from:sender];
-		return;
-	}
-	id responder = _window.firstResponder;
-	if ([responder isKindOfClass:[NSText class]]) {
-		[responder selectAll:sender];
 		return;
 	}
 	[[self activeEditor] message:SCI_SELECTALL];

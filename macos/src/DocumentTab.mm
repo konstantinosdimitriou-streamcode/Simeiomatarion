@@ -35,6 +35,7 @@ static int KeywordIndex(NSString *name) {
 	int _monitorFD;
 	ScintillaView *_mirror;
 	BOOL _pairing;
+	BOOL _spellEcho;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -376,6 +377,9 @@ static int KeywordIndex(NSString *name) {
 			[self.delegate documentTabDidScroll:self];
 		}
 		if (updated & (SC_UPDATE_CONTENT | SC_UPDATE_SELECTION)) {
+			if (_spellEcho) {
+				return;
+			}
 			[self.delegate documentTabDidChange:self];
 			if (_settings.spellCheck) {
 				[NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(refreshSpelling) object:nil];
@@ -502,8 +506,14 @@ static int KeywordIndex(NSString *name) {
 - (void)refreshSpelling {
 	ScintillaView *editor = self.editor;
 	long length = [editor message:SCI_GETLENGTH];
+	_spellEcho = YES;
 	[editor message:SCI_SETINDICATORCURRENT wParam:11 lParam:0];
 	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+	__weak DocumentTab *weakSelf = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		DocumentTab *strongSelf = weakSelf;
+		strongSelf->_spellEcho = NO;
+	});
 	if (!_settings.spellCheck) {
 		return;
 	}
