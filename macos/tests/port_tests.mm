@@ -66,7 +66,7 @@ static void TestEncoding(void) {
 	std::string error;
 	Expect(EncodeBuffer("hi", kEncodingUTF8BOM, &encoded, &error) && encoded.size() == 5 && (unsigned char)encoded[0] == 0xEF, "utf-8 bom roundtrip");
 	Expect(EncodeBuffer(std::string("A\0B", 3), kEncodingUTF16LE, &encoded, &error) && encoded.size() >= 4 && (unsigned char)encoded[0] == 0xFF, "utf-16 encode");
-	Expect(NppEncodingCount() >= 50, "notepad++ encoding catalogue");
+	Expect(NppEncodingCount() >= 50, "encoding catalogue");
 	Expect(EncodeBuffer("\xC3\xA9", kEncodingWindows1252, &encoded, &error) && encoded.size() == 1 && (unsigned char)encoded[0] == 0xE9, "windows-1252 e acute");
 	int greek = NppEncodingIdNamed("ISO 8859-7");
 	const uint8_t greekByte[] = {0xE1};

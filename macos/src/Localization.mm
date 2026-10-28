@@ -30,6 +30,10 @@ static NSDictionary<NSString *, NSString *> *GreekTable(void) {
 	dispatch_once(&once, ^{
 		table = @{
 			@"About Simeiomatarion": @"Περί του Simeiomatarion",
+			@"Search This Folder": @"Αναζήτηση σε αυτόν τον φάκελο",
+			@"Choose the folder to search. Simeiomatarion can only search folders you choose.": @"Διάλεξε τον φάκελο για αναζήτηση. Το Simeiomatarion ψάχνει μόνο σε φακέλους που διαλέγεις εσύ.",
+			@"Acknowledgements…": @"Ευχαριστίες και άδειες…",
+			@"Acknowledgements / Licenses": @"Ευχαριστίες / Άδειες",
 			@"Add Next Occurrence": @"Πρόσθεσε την επόμενη εμφάνιση",
 			@"Always on Top": @"Πάντα από πάνω",
 			@"Appearance": @"Εμφάνιση",

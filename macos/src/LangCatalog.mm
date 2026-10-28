@@ -1,7 +1,7 @@
 #import "LangCatalog.h"
 
 // Language name -> Lexilla lexer id, taken from
-// PowerEditor/src/ScintillaComponent/ScintillaEditView.cpp in Notepad++ 8.9.8.1.
+// PowerEditor/src/ScintillaComponent/ScintillaEditView.cpp in the upstream tree (see NOTICE).
 static const char *kLangLexerPairs[][2] = {
 	{"normal", "null"}, {"php", "phpscript"}, {"c", "cpp"}, {"cpp", "cpp"}, {"cs", "cpp"},
 	{"objc", "objc"}, {"java", "cpp"}, {"rc", "cpp"}, {"html", "hypertext"}, {"xml", "xml"},

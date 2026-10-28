@@ -4,15 +4,56 @@ CC := clang
 SDK := $(shell xcrun --show-sdk-path)
 MIN := 12.0
 UP := ../upstream
+# Fetch the pinned third-party source tree on first build (see NOTICE).
+ifeq ($(wildcard $(UP)/scintilla/src/Editor.cxx),)
+$(info upstream/ missing, running ../scripts/fetch-upstream.sh)
+FETCH_STATUS := $(shell ../scripts/fetch-upstream.sh >&2; echo $$?)
+ifneq ($(FETCH_STATUS),0)
+$(error scripts/fetch-upstream.sh failed)
+endif
+endif
+# Flavours: FLAVOR=developer (default, Developer ID / direct download, full features)
+# and FLAVOR=appstore (App Sandbox, bundled plugins only, single process).
+FLAVOR ?= developer
+ifeq ($(FLAVOR),appstore)
+B := build/appstore
+FLAVOR_FLAGS := -DSIMEIO_APP_STORE=1
+ENTITLEMENTS := Simeiomatarion.entitlements
+else ifeq ($(FLAVOR),developer)
+B := build
+FLAVOR_FLAGS :=
+ENTITLEMENTS := Simeiomatarion.developer.entitlements
+else
+$(error FLAVOR must be developer or appstore)
+endif
+
+# Signing: ad-hoc by default. For a real identity, e.g.
+#   make FLAVOR=appstore SIGN_IDENTITY="Apple Distribution: …" TEAM_ID=XXXXXXXXXX
+# TEAM_ID adds the application-identifier and team-identifier entitlements (App Store).
+SIGN_IDENTITY ?= -
+TEAM_ID ?=
+BUNDLE_ID := gr.streamcode.simeiomatarion
+ifeq ($(SIGN_IDENTITY),-)
+SIGN_TIMESTAMP := --timestamp=none
+else
+SIGN_TIMESTAMP := --timestamp
+endif
+ifneq ($(and $(filter appstore,$(FLAVOR)),$(TEAM_ID)),)
+SIGN_ENTITLEMENTS := $(B)/Simeiomatarion.entitlements
+else
+SIGN_ENTITLEMENTS := $(ENTITLEMENTS)
+endif
+SIGN := codesign --force --options runtime $(SIGN_TIMESTAMP) --sign "$(SIGN_IDENTITY)"
+
 SYS := -arch $(ARCH) -isysroot "$(SDK)" -mmacosx-version-min=$(MIN)
 CXXFLAGS := $(SYS) -std=c++17 -O2
 THIRD_FLAGS := $(CXXFLAGS) -w -DNDEBUG
 SCI_INCLUDES := -I$(UP)/scintilla/include -I$(UP)/scintilla/src -I$(UP)/boostregex
 LEX_INCLUDES := -Icompat -I$(UP)/lexilla/include -I$(UP)/lexilla/lexlib -I$(UP)/scintilla/include
 APP_INCLUDES := -Isrc $(SCI_INCLUDES) -I$(UP)/lexilla/include -I$(UP)/scintilla/cocoa
-OBJCXX := $(CXXFLAGS) -fobjc-arc -Wall -Wextra -Wno-unused-parameter
+OBJCXX := $(CXXFLAGS) $(FLAVOR_FLAGS) -fobjc-arc -Wall -Wextra -Wno-unused-parameter
 PREFIX := -include src/sdk_prefix.h
-APP := build/Simeiomatarion.app
+APP := $(B)/Simeiomatarion.app
 
 # Version: ../VERSION (semver) and ../BUILD_NUMBER are the single source of truth.
 # Override on the command line for CI, e.g. `make BUILD_NUMBER=42`.
@@ -23,68 +64,84 @@ SCI_SRC := $(wildcard $(UP)/scintilla/src/*.cxx)
 COCOA_SRC := $(UP)/scintilla/cocoa/PlatCocoa.mm $(UP)/scintilla/cocoa/ScintillaCocoa.mm $(UP)/scintilla/cocoa/ScintillaView.mm $(UP)/scintilla/cocoa/InfoBar.mm
 BOOST_SRC := $(UP)/boostregex/BoostRegExSearch.cxx $(UP)/boostregex/UTF8DocumentIterator.cxx
 LEX_SRC := $(wildcard $(UP)/lexilla/src/*.cxx) $(wildcard $(UP)/lexilla/lexlib/*.cxx) $(wildcard $(UP)/lexilla/lexers/*.cxx)
-APP_MM := src/main.mm src/AppDelegate.mm src/DocumentTab.mm src/Search.mm src/LangCatalog.mm src/EditorSettings.mm src/MacroStore.mm src/EditorActions.mm src/StyleTheme.mm src/OutlineIndex.mm src/SnippetStore.mm src/PreviewHTML.mm src/UserLanguages.mm src/ClipboardHistory.mm src/MinimapView.mm src/Localization.mm src/TextTools.mm src/OfficeOpen.mm
+APP_MM := src/main.mm src/AppDelegate.mm src/DocumentTab.mm src/Search.mm src/LangCatalog.mm src/EditorSettings.mm src/MacroStore.mm src/EditorActions.mm src/StyleTheme.mm src/OutlineIndex.mm src/SnippetStore.mm src/PreviewHTML.mm src/UserLanguages.mm src/ClipboardHistory.mm src/MinimapView.mm src/Localization.mm src/TextTools.mm src/OfficeOpen.mm src/SandboxAccess.mm
 APP_CC := src/Encoding.cc
 
-SCI_OBJ := $(patsubst $(UP)/scintilla/src/%.cxx,build/obj/sci/%.o,$(SCI_SRC))
-COCOA_OBJ := $(patsubst $(UP)/scintilla/cocoa/%.mm,build/obj/cocoa/%.o,$(COCOA_SRC))
-BOOST_OBJ := $(patsubst $(UP)/boostregex/%.cxx,build/obj/boost/%.o,$(BOOST_SRC))
-LEX_OBJ := $(patsubst $(UP)/lexilla/src/%.cxx,build/obj/lex/src/%.o,$(filter $(UP)/lexilla/src/%,$(LEX_SRC))) \
-	$(patsubst $(UP)/lexilla/lexlib/%.cxx,build/obj/lex/lib/%.o,$(filter $(UP)/lexilla/lexlib/%,$(LEX_SRC))) \
-	$(patsubst $(UP)/lexilla/lexers/%.cxx,build/obj/lex/lexers/%.o,$(filter $(UP)/lexilla/lexers/%,$(LEX_SRC)))
-APP_OBJ := $(patsubst src/%.mm,build/obj/app/%.o,$(APP_MM)) $(patsubst src/%.cc,build/obj/app/%.o,$(APP_CC))
+SCI_OBJ := $(patsubst $(UP)/scintilla/src/%.cxx,$(B)/obj/sci/%.o,$(SCI_SRC))
+COCOA_OBJ := $(patsubst $(UP)/scintilla/cocoa/%.mm,$(B)/obj/cocoa/%.o,$(COCOA_SRC))
+BOOST_OBJ := $(patsubst $(UP)/boostregex/%.cxx,$(B)/obj/boost/%.o,$(BOOST_SRC))
+LEX_OBJ := $(patsubst $(UP)/lexilla/src/%.cxx,$(B)/obj/lex/src/%.o,$(filter $(UP)/lexilla/src/%,$(LEX_SRC))) \
+	$(patsubst $(UP)/lexilla/lexlib/%.cxx,$(B)/obj/lex/lib/%.o,$(filter $(UP)/lexilla/lexlib/%,$(LEX_SRC))) \
+	$(patsubst $(UP)/lexilla/lexers/%.cxx,$(B)/obj/lex/lexers/%.o,$(filter $(UP)/lexilla/lexers/%,$(LEX_SRC)))
+APP_OBJ := $(patsubst src/%.mm,$(B)/obj/app/%.o,$(APP_MM)) $(patsubst src/%.cc,$(B)/obj/app/%.o,$(APP_CC))
 ENGINE_OBJ := $(SCI_OBJ) $(COCOA_OBJ) $(BOOST_OBJ) $(LEX_OBJ)
-TEST_OBJ := build/obj/app/port_tests.o build/obj/app/Encoding.o build/obj/app/LangCatalog.o build/obj/app/Search.o build/obj/app/EditorActions.o build/obj/app/EditorSettings.o build/obj/app/StyleTheme.o build/obj/app/DocumentTab.o build/obj/app/OutlineIndex.o build/obj/app/SnippetStore.o build/obj/app/PreviewHTML.o build/obj/app/UserLanguages.o build/obj/app/ClipboardHistory.o build/obj/app/Localization.o build/obj/app/TextTools.o build/obj/app/OfficeOpen.o
+TEST_OBJ := $(B)/obj/app/port_tests.o $(B)/obj/app/Encoding.o $(B)/obj/app/LangCatalog.o $(B)/obj/app/Search.o $(B)/obj/app/EditorActions.o $(B)/obj/app/EditorSettings.o $(B)/obj/app/StyleTheme.o $(B)/obj/app/DocumentTab.o $(B)/obj/app/OutlineIndex.o $(B)/obj/app/SnippetStore.o $(B)/obj/app/PreviewHTML.o $(B)/obj/app/UserLanguages.o $(B)/obj/app/ClipboardHistory.o $(B)/obj/app/Localization.o $(B)/obj/app/TextTools.o $(B)/obj/app/OfficeOpen.o
 
-.PHONY: all clean test resources plugin version $(APP)/Contents/Info.plist
+.PHONY: all clean test resources plugin version sign appstore developer $(APP)/Contents/Info.plist
 
 version:
 	@echo "$(VERSION) ($(BUILD_NUMBER))"
 
-all: $(APP)/Contents/MacOS/NotepadPlusPlus $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin build/port_tests
-	codesign --force --sign - $(APP)
+all: $(APP)/Contents/MacOS/Simeiomatarion $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin $(B)/port_tests sign
 
-build/obj/sci/%.o: $(UP)/scintilla/src/%.cxx
+# Plugins first, then the app with the flavour's entitlements, all with the hardened runtime.
+sign: $(APP)/Contents/MacOS/Simeiomatarion $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin $(SIGN_ENTITLEMENTS)
+	for dylib in $(APP)/Contents/PlugIns/*.dylib; do $(SIGN) "$$dylib" || exit 1; done
+	$(SIGN) --entitlements $(SIGN_ENTITLEMENTS) $(APP)
+	codesign --verify --strict --deep $(APP)
+
+$(B)/Simeiomatarion.entitlements: Simeiomatarion.appstore-team.entitlements.in
+	@mkdir -p $(B)
+	sed -e 's/@TEAM_ID@/$(TEAM_ID)/g' -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/g' $< > $@
+	plutil -lint $@
+
+appstore:
+	$(MAKE) FLAVOR=appstore test
+
+developer:
+	$(MAKE) FLAVOR=developer test
+
+$(B)/obj/sci/%.o: $(UP)/scintilla/src/%.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -DSCI_OWNREGEX -DBOOST_REGEX_STANDALONE $(SCI_INCLUDES) -c $< -o $@
 
-build/obj/cocoa/%.o: $(UP)/scintilla/cocoa/%.mm
+$(B)/obj/cocoa/%.o: $(UP)/scintilla/cocoa/%.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -fobjc-arc -DSCI_OWNREGEX -DBOOST_REGEX_STANDALONE $(PREFIX) $(SCI_INCLUDES) -I$(UP)/scintilla/cocoa -c $< -o $@
 
-build/obj/boost/%.o: $(UP)/boostregex/%.cxx
+$(B)/obj/boost/%.o: $(UP)/boostregex/%.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -DSCI_OWNREGEX -DBOOST_REGEX_STANDALONE $(SCI_INCLUDES) -c $< -o $@
 
-build/obj/lex/src/%.o: $(UP)/lexilla/src/%.cxx
+$(B)/obj/lex/src/%.o: $(UP)/lexilla/src/%.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -fvisibility=hidden $(LEX_INCLUDES) -c $< -o $@
 
-build/obj/lex/lib/%.o: $(UP)/lexilla/lexlib/%.cxx
+$(B)/obj/lex/lib/%.o: $(UP)/lexilla/lexlib/%.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -fvisibility=hidden $(LEX_INCLUDES) -c $< -o $@
 
-build/obj/lex/lexers/%.o: $(UP)/lexilla/lexers/%.cxx
+$(B)/obj/lex/lexers/%.o: $(UP)/lexilla/lexers/%.cxx
 	@mkdir -p $(dir $@)
 	$(CXX) $(THIRD_FLAGS) -fvisibility=hidden $(LEX_INCLUDES) -c $< -o $@
 
-build/obj/app/%.o: src/%.mm
+$(B)/obj/app/%.o: src/%.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJCXX) $(APP_INCLUDES) -c $< -o $@
 
-build/obj/app/%.o: src/%.cc
+$(B)/obj/app/%.o: src/%.cc
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -Wall -Wextra -Wno-unused-parameter -Isrc -c $< -o $@
 
-build/obj/app/port_tests.o: tests/port_tests.mm
+$(B)/obj/app/port_tests.o: tests/port_tests.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJCXX) $(APP_INCLUDES) -c $< -o $@
 
-$(APP)/Contents/MacOS/NotepadPlusPlus: $(APP_OBJ) $(ENGINE_OBJ)
+$(APP)/Contents/MacOS/Simeiomatarion: $(APP_OBJ) $(ENGINE_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework WebKit -framework PDFKit -liconv -lz -o $@
 
-build/port_tests: $(TEST_OBJ) $(ENGINE_OBJ)
+$(B)/port_tests: $(TEST_OBJ) $(ENGINE_OBJ)
 	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework PDFKit -liconv -lz -o $@
 
 $(APP)/Contents/Info.plist: Info.plist ../VERSION ../BUILD_NUMBER
@@ -98,8 +155,8 @@ $(APP)/Contents/PkgInfo:
 	@mkdir -p $(APP)/Contents
 	printf 'APPL????' > $@
 
-ICON_SRC := resources/AppIcon.jpg
-ICONSET := build/AppIcon.iconset
+ICON_SRC := resources/AppIcon.png
+ICONSET := $(B)/AppIcon.iconset
 
 $(APP)/Contents/Resources/AppIcon.icns: $(ICON_SRC)
 	@mkdir -p $(ICONSET) $(APP)/Contents/Resources
@@ -118,8 +175,13 @@ $(APP)/Contents/Resources/AppIcon.icns: $(ICON_SRC)
 
 resources: $(APP)/Contents/Info.plist $(APP)/Contents/Resources/AppIcon.icns
 	@mkdir -p $(APP)/Contents/Resources
-	cp $(UP)/PowerEditor/src/langs.model.xml $(APP)/Contents/Resources/langs.model.xml
-	cp $(UP)/PowerEditor/src/stylers.model.xml $(APP)/Contents/Resources/stylers.model.xml
+	cp resources/PrivacyInfo.xcprivacy $(APP)/Contents/Resources/PrivacyInfo.xcprivacy
+	cp ../LICENSE $(APP)/Contents/Resources/LICENSE
+	cp ../NOTICE $(APP)/Contents/Resources/NOTICE
+	# Same files as upstream, with the XML root element renamed. Lookups use //Language and //LexerType.
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/langs.model.xml > $(APP)/Contents/Resources/langs.model.xml
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/stylers.model.xml > $(APP)/Contents/Resources/stylers.model.xml
+	xmllint --noout $(APP)/Contents/Resources/langs.model.xml $(APP)/Contents/Resources/stylers.model.xml
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_busy.png --out $(APP)/Contents/Resources/mac_cursor_busy.tiff >/dev/null
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_flipped.png --out $(APP)/Contents/Resources/mac_cursor_flipped.tiff >/dev/null
 
@@ -131,7 +193,7 @@ plugin: $(APP)/Contents/Info.plist
 	$(CC) $(SYS) -fobjc-arc -dynamiclib -Isrc plugins/json/JsonTools.m -framework Foundation -o $(APP)/Contents/PlugIns/JsonTools.dylib
 
 test: all
-	./build/port_tests $(UP)/PowerEditor/src/langs.model.xml
+	./$(B)/port_tests $(UP)/PowerEditor/src/langs.model.xml
 
 clean:
 	rm -rf build

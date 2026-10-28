@@ -11,6 +11,7 @@
 #import "MinimapView.h"
 #import "NppMacPlugin.h"
 #import "OfficeOpen.h"
+#import "SandboxAccess.h"
 #import "OutlineIndex.h"
 #import "PreviewHTML.h"
 #import "Search.h"
@@ -538,11 +539,30 @@ static long NppZoomColumnPosition(ScintillaView *editor, long line, long visualC
 @implementation NppTabChip
 @end
 
+// Folder name used by builds before 1.0.0. Only read, once, to copy old settings.
+static NSString *const kLegacySupportFolderName = @"NotepadPlusPlus";
+
 static NSURL *SupportDirectory(void) {
-	NSFileManager *files = [NSFileManager defaultManager];
-	NSURL *base = [files URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
-	NSURL *directory = [base URLByAppendingPathComponent:@"NotepadPlusPlus" isDirectory:YES];
-	[files createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	static NSURL *directory;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSFileManager *files = [NSFileManager defaultManager];
+		NSURL *base = [files URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+		directory = [base URLByAppendingPathComponent:@"Simeiomatarion" isDirectory:YES];
+		if (![files fileExistsAtPath:directory.path]) {
+			// One-time migration: copy (never move) the pre-1.0.0 folder. Under the App Sandbox
+			// the old folder is outside the container and simply is not there, so this is skipped.
+			NSURL *legacy = [base URLByAppendingPathComponent:kLegacySupportFolderName isDirectory:YES];
+			BOOL isDirectory = NO;
+			if ([files fileExistsAtPath:legacy.path isDirectory:&isDirectory] && isDirectory && [files isReadableFileAtPath:legacy.path]) {
+				NSError *error = nil;
+				if (![files copyItemAtURL:legacy toURL:directory error:&error]) {
+					NSLog(@"Simeiomatarion: could not copy old settings: %@", error.localizedDescription);
+				}
+			}
+		}
+		[files createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	});
 	return directory;
 }
 
@@ -2645,6 +2665,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	dispatch_once(&once, ^{
 		symbols = @{
 			@"About Simeiomatarion": @"info.circle",
+			@"Acknowledgements…": @"doc.text",
 			@"Add Next Occurrence": @"plus.magnifyingglass",
 			@"All": @"square.and.arrow.down.on.square",
 			@"Always on Top": @"pin",
@@ -2865,6 +2886,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	NSMenu *bar = [NSMenu new];
 	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Simeiomatarion"];
 	[appMenu addItem:[self item:@"About Simeiomatarion" action:@selector(showAbout:) command:nil]];
+	[appMenu addItem:[self item:@"Acknowledgements…" action:@selector(showAcknowledgements:) command:nil]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
 	[appMenu addItem:[self item:@"Preferences…" action:@selector(showPreferences:) command:@"preferences"]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
@@ -2879,9 +2901,12 @@ static NSString *NppMenuSymbol(NSString *title) {
 	NSMenu *file = [NSMenu new];
 	file.title = @"File";
 	[file addItem:[self item:@"New" action:@selector(newDocument:) command:@"new"]];
-	NSMenuItem *newWindow = [self item:@"New Window" action:@selector(newWindow:) command:nil];
-	newWindow.enabled = _settings.extraWindows;
-	[file addItem:newWindow];
+	if (!SIMEIO_APP_STORE) {
+		// New windows run as a second app instance, which the App Store flavour does not allow.
+		NSMenuItem *newWindow = [self item:@"New Window" action:@selector(newWindow:) command:nil];
+		newWindow.enabled = _settings.extraWindows;
+		[file addItem:newWindow];
+	}
 	[file addItem:[self item:@"Open…" action:@selector(openDocument:) command:@"open"]];
 	[file addItem:[self item:@"Open Folder…" action:@selector(openFolder:) command:@"openFolder"]];
 	[file addItem:[self item:@"Open Quickly…" action:@selector(showQuickOpen:) command:@"quickOpen"]];
@@ -3230,7 +3255,9 @@ static NSString *NppMenuSymbol(NSString *title) {
 	}
 	[plugins addItem:[NSMenuItem separatorItem]];
 	[plugins addItem:[self item:@"Reload Plugins" action:@selector(reloadPlugins:) command:nil]];
-	[plugins addItem:[self item:@"Open Plugins Folder" action:@selector(openPluginsFolder:) command:nil]];
+	if (!SIMEIO_APP_STORE) {
+		[plugins addItem:[self item:@"Open Plugins Folder" action:@selector(openPluginsFolder:) command:nil]];
+	}
 	[self addMenu:plugins title:@"Plugins" to:bar];
 
 	NSMenu *windowMenu = [NSMenu new];
@@ -4018,6 +4045,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 }
 
 - (BOOL)openPath:(NSString *)path {
+	NppBeginAccess(path);
 	NppOfficeKind kind = NppOfficeKindForPath(path);
 	if (kind == NppOfficeKindPDF || kind == NppOfficeKindDOC || kind == NppOfficeKindDOCX) {
 		return [self openRichDocumentAtPath:path kind:kind];
@@ -4122,9 +4150,17 @@ static NSString *NppMenuSymbol(NSString *title) {
 		return NO;
 	}
 	NSData *data = [NSData dataWithBytes:encoded.data() length:encoded.size()];
+	NppBeginAccess(path);
 	[self backupFileIfNeeded:path];
 	NSError *writeError = nil;
-	if (![data writeToFile:path options:NSDataWritingAtomic error:&writeError]) {
+	BOOL written = [data writeToFile:path options:NSDataWritingAtomic error:&writeError];
+	if (!written && NppIsSandboxed()) {
+		// An atomic write needs a temporary file next to the target. The sandbox may only
+		// grant the file itself, so write in place.
+		writeError = nil;
+		written = [data writeToFile:path options:0 error:&writeError];
+	}
+	if (!written) {
 		if (error) {
 			*error = writeError.localizedDescription;
 		}
@@ -4421,6 +4457,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	if (path.length == 0) {
 		return;
 	}
+	NppRememberAccess(path);
 	NSMutableArray *recent = [[[NSUserDefaults standardUserDefaults] arrayForKey:@"recentFiles"] mutableCopy] ?: [NSMutableArray array];
 	[recent removeObject:path];
 	[recent insertObject:path atIndex:0];
@@ -4679,7 +4716,13 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)presentFindInFilesReplacing:(BOOL)replacing {
 	DocumentTab *document = [self currentDocument];
 	if (_filesDirectory.stringValue.length == 0) {
-		_filesDirectory.stringValue = document.path.length ? document.path.stringByDeletingLastPathComponent : NSHomeDirectory();
+		if (document.path.length) {
+			_filesDirectory.stringValue = document.path.stringByDeletingLastPathComponent;
+		} else if (_folderRoot.length) {
+			_filesDirectory.stringValue = _folderRoot;
+		} else if (!NppIsSandboxed()) {
+			_filesDirectory.stringValue = NSHomeDirectory();
+		}
 	}
 	if (_findField.stringValue.length) {
 		_filesQuery.stringValue = _findField.stringValue;
@@ -4724,8 +4767,37 @@ static NSString *NppMenuSymbol(NSString *title) {
 		panel.directoryURL = [NSURL fileURLWithPath:_filesDirectory.stringValue];
 	}
 	if ([panel runModal] == NSModalResponseOK) {
+		NppRememberAccess(panel.URL.path);
 		_filesDirectory.stringValue = panel.URL.path;
 	}
+}
+
+// Under the App Sandbox a folder can be searched only after the user granted it.
+// Returns the folder to search, asking with an open panel when access is missing.
+- (NSString *)grantedFindDirectory {
+	NSString *directory = _filesDirectory.stringValue;
+	BOOL isDirectory = NO;
+	if (directory.length && NppBeginAccess(directory) && [[NSFileManager defaultManager] fileExistsAtPath:directory isDirectory:&isDirectory] && isDirectory && [[NSFileManager defaultManager] isReadableFileAtPath:directory]) {
+		return directory;
+	}
+	if (!NppIsSandboxed()) {
+		return directory;
+	}
+	NSOpenPanel *panel = [NSOpenPanel openPanel];
+	panel.canChooseFiles = NO;
+	panel.canChooseDirectories = YES;
+	panel.allowsMultipleSelection = NO;
+	panel.prompt = NppL(@"Search This Folder");
+	panel.message = NppL(@"Choose the folder to search. Simeiomatarion can only search folders you choose.");
+	if (directory.length) {
+		panel.directoryURL = [NSURL fileURLWithPath:directory];
+	}
+	if ([panel runModal] != NSModalResponseOK) {
+		return nil;
+	}
+	NppRememberAccess(panel.URL.path);
+	_filesDirectory.stringValue = panel.URL.path;
+	return panel.URL.path;
 }
 
 - (SearchFlags)fileSearchFlags {
@@ -4769,7 +4841,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)runFindInFiles:(id)sender {
 	(void)sender;
 	NSString *query = _filesQuery.stringValue;
-	NSString *directory = _filesDirectory.stringValue;
+	NSString *directory = query.length ? ([self grantedFindDirectory] ?: @"") : _filesDirectory.stringValue;
 	BOOL directoryExists = NO;
 	[[NSFileManager defaultManager] fileExistsAtPath:directory isDirectory:&directoryExists];
 	if (query.length == 0 || !directoryExists) {
@@ -4829,7 +4901,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)runReplaceInFiles:(id)sender {
 	(void)sender;
 	NSString *query = _filesQuery.stringValue;
-	NSString *directory = _filesDirectory.stringValue;
+	NSString *directory = query.length ? ([self grantedFindDirectory] ?: @"") : _filesDirectory.stringValue;
 	BOOL directoryExists = NO;
 	[[NSFileManager defaultManager] fileExistsAtPath:directory isDirectory:&directoryExists];
 	if (query.length == 0 || !directoryExists) {
@@ -5920,14 +5992,45 @@ static NSString *NppMenuSymbol(NSString *title) {
 	[self refreshStatus];
 }
 
+static NSString *const kSourceURL = @"https://github.com/konstantinosdimitriou-streamcode/Simeiomatarion";
+
 - (void)showAbout:(id)sender {
 	(void)sender;
-	NSAlert *alert = [NSAlert new];
 	NSDictionary *info = NSBundle.mainBundle.infoDictionary;
 	NSString *version = info[@"CFBundleShortVersionString"] ?: @"?";
 	NSString *build = info[@"CFBundleVersion"] ?: @"?";
+	NSString *copyright = info[@"NSHumanReadableCopyright"] ?: @"";
+	NSAlert *alert = [NSAlert new];
 	alert.messageText = @"Simeiomatarion";
-	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.", version, build];
+	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText and code editor for Apple Silicon.\n\n%@\nSource code: %@", version, build, copyright, kSourceURL];
+	[alert addButtonWithTitle:NppL(@"OK")];
+	[alert addButtonWithTitle:NppL(@"Acknowledgements…")];
+	if ([alert runModal] == NSAlertSecondButtonReturn) {
+		[self showAcknowledgements:nil];
+	}
+}
+
+- (void)showAcknowledgements:(id)sender {
+	(void)sender;
+	NSURL *url = [NSBundle.mainBundle URLForResource:@"NOTICE" withExtension:nil];
+	NSString *notice = url ? [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil] : nil;
+	if (!notice.length) {
+		notice = [NSString stringWithFormat:@"Licensed under the GNU GPL v3. See %@", kSourceURL];
+	}
+	NSAlert *alert = [NSAlert new];
+	alert.messageText = NppL(@"Acknowledgements / Licenses");
+	alert.informativeText = [NSString stringWithFormat:@"Copyright notices and licenses. The complete source code is available under the GNU GPL v3 at %@", kSourceURL];
+	NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 560, 320)];
+	scroll.hasVerticalScroller = YES;
+	scroll.borderType = NSBezelBorder;
+	NSTextView *text = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 560, 320)];
+	text.editable = NO;
+	text.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+	text.string = notice;
+	text.autoresizingMask = NSViewWidthSizable;
+	text.textContainer.widthTracksTextView = YES;
+	scroll.documentView = text;
+	alert.accessoryView = scroll;
 	[alert runModal];
 }
 
@@ -5998,7 +6101,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 
 - (void)newWindow:(id)sender {
 	(void)sender;
-	if (!_settings.extraWindows) {
+	if (SIMEIO_APP_STORE || !_settings.extraWindows) {
 		return;
 	}
 	NSWorkspaceOpenConfiguration *configuration = [NSWorkspaceOpenConfiguration configuration];
@@ -6007,7 +6110,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 }
 
 - (void)moveDocumentToNewWindow:(DocumentTab *)document {
-	if (!_settings.extraWindows || !document || ![_documents containsObject:document]) {
+	if (SIMEIO_APP_STORE || !_settings.extraWindows || !document || ![_documents containsObject:document]) {
 		return;
 	}
 	if (document.dirty || document.path.length == 0) {
@@ -6259,6 +6362,9 @@ static NSString *NppMenuSymbol(NSString *title) {
 			case 819: value = _settings.formatDocuments; break;
 		}
 		button.state = value ? NSControlStateValueOn : NSControlStateValueOff;
+	}
+	if (SIMEIO_APP_STORE) {
+		[_preferencesWindow.contentView viewWithTag:818].hidden = YES;
 	}
 	[language selectItemAtIndex:[_settings.uiLanguage isEqualToString:@"en"] ? 1 : ([_settings.uiLanguage isEqualToString:@"el"] ? 2 : 0)];
 	[unit selectItemAtIndex:[_settings.fileSizeUnit isEqualToString:@"kb"] ? 1 : ([_settings.fileSizeUnit isEqualToString:@"mb"] ? 2 : 0)];
@@ -6788,10 +6894,12 @@ static NSString *NppMenuSymbol(NSString *title) {
 	if ([panel runModal] != NSModalResponseOK) {
 		return;
 	}
+	NppRememberAccess(panel.URL.path);
 	[self showFolderAtPath:panel.URL.path];
 }
 
 - (void)showFolderAtPath:(NSString *)path {
+	NppBeginAccess(path);
 	BOOL directory = NO;
 	if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&directory] || !directory) {
 		return;
@@ -6810,7 +6918,8 @@ static NSString *NppMenuSymbol(NSString *title) {
 	title.stringValue = path.lastPathComponent.length ? path.lastPathComponent : path;
 	title.toolTip = path;
 	NSTextField *pathField = [_sidebar viewWithTag:2];
-	pathField.stringValue = path;
+	// Show home-relative paths as ~/… (inside the App Sandbox, ~ is the app container).
+	pathField.stringValue = path.stringByAbbreviatingWithTildeInPath;
 	pathField.toolTip = path;
 	[_folderOutline reloadData];
 	[_folderOutline expandItem:nil expandChildren:NO];
@@ -6858,7 +6967,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	path = path.stringByStandardizingPath;
 	BOOL directory = NO;
 	if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&directory]) {
-		pathField.stringValue = _folderRoot ?: @"";
+		pathField.stringValue = _folderRoot.stringByAbbreviatingWithTildeInPath ?: @"";
 		[self alert:@"That path does not exist."];
 		return;
 	}
@@ -7129,7 +7238,8 @@ static NSArray<NSDictionary *> *NppCollectFolderMatches(NSString *root, NSString
 			[paths addObject:[bundledDirectory stringByAppendingPathComponent:name]];
 		}
 	}
-	for (NSURL *url in [files contentsOfDirectoryAtURL:[self pluginsDirectory] includingPropertiesForKeys:nil options:0 error:nil]) {
+	// The App Store flavour loads only the plugins signed inside the bundle (Contents/PlugIns).
+	for (NSURL *url in SIMEIO_APP_STORE ? @[] : [files contentsOfDirectoryAtURL:[self pluginsDirectory] includingPropertiesForKeys:nil options:0 error:nil]) {
 		if ([url.pathExtension isEqualToString:@"dylib"]) {
 			[paths addObject:url.path];
 		}
@@ -7140,6 +7250,7 @@ static NSArray<NSDictionary *> *NppCollectFolderMatches(NSString *root, NSString
 		if (!handle) {
 			const char *error = dlerror();
 			[_pluginErrors addObject:[NSString stringWithFormat:@"%@: %s", path.lastPathComponent, error ? error : "could not load"]];
+			NSLog(@"Simeiomatarion: plugin %@ did not load: %s", path.lastPathComponent, error ? error : "unknown error");
 			continue;
 		}
 		auto entry = reinterpret_cast<NppMacPluginEntryFn>(dlsym(handle, "NppMacPluginEntry"));
@@ -7175,6 +7286,9 @@ static NSArray<NSDictionary *> *NppCollectFolderMatches(NSString *root, NSString
 
 - (void)openPluginsFolder:(id)sender {
 	(void)sender;
+	if (SIMEIO_APP_STORE) {
+		return;
+	}
 	[NSWorkspace.sharedWorkspace openURL:[self pluginsDirectory]];
 }
 
