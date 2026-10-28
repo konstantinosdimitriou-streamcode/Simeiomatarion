@@ -98,7 +98,10 @@ workflows:
       - name: Package .pkg
         script: |
           set -euo pipefail
-          productbuild --component "$APP_PATH" /Applications --sign "$PKG_SIGN_IDENTITY" "$PKG_PATH"
+          # productsign, not productbuild --sign: the CLI keychain lets codesign and productsign use the keys.
+          productbuild --component "$APP_PATH" /Applications "$PKG_PATH.unsigned"
+          productsign --sign "$PKG_SIGN_IDENTITY" "$PKG_PATH.unsigned" "$PKG_PATH"
+          rm "$PKG_PATH.unsigned"
           pkgutil --check-signature "$PKG_PATH"
           ls -l "$PKG_PATH"
       - name: Upload to App Store Connect (no review submission)
