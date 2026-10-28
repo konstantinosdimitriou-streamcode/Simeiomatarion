@@ -10,11 +10,11 @@ The app version lives in [`VERSION`](VERSION) and the build number in [`BUILD_NU
 
 ## [1.0.0] - 2026-10-28
 
-First versioned release of Simeiomatarion, a native arm64 macOS editor based on Notepad++ 8.9.8.1 source code under GPL-3 (not affiliated with or endorsed by the Notepad++ project).
+First versioned release of Simeiomatarion, a native arm64 text and code editor for macOS.
 
 ### Added
 
-- Native AppKit app around the upstream editing engine: Scintilla 5.6.6, Lexilla 5.5.3 and the Boost.Regex search, statically linked into one arm64 executable.
+- Native AppKit app using Scintilla 5.6.6, Lexilla 5.5.3 and Boost.Regex, statically linked into one arm64 executable.
 - Tabs, opening files dropped onto the window or the Dock icon, and several files side by side in panes that keep their own tabs and sizes, with in-place compare.
 - Syntax highlighting and folding for every Lexilla lexer, with keywords and styles from `langs.model.xml` and `stylers.model.xml`.
 - Find, find previous, replace, replace all, regular expressions and Find in Files. The current match is highlighted and scrolled into view, and a document can be closed from its Find in Files row.
@@ -25,11 +25,13 @@ First versioned release of Simeiomatarion, a native arm64 macOS editor based on 
 - Native dylib plugin ABI with bundled sample, MIME tools, converter and JSON tools plugins.
 - Localization support and an app icon.
 - `VERSION` and `BUILD_NUMBER` as the single source of truth for `CFBundleShortVersionString` and `CFBundleVersion`. The About box shows the version.
-- GPL-3.0 `LICENSE` and a README with the GPL attribution and screenshots.
+- GPL-3.0 `LICENSE`, `NOTICE` with third-party copyright notices (also in the app under About → Acknowledgements), and README screenshots.
+- `scripts/fetch-upstream.sh` fetches and verifies the third-party source tree; the Makefile runs it when `upstream/` is missing.
+- App Store metadata: bundle identifier `gr.streamcode.simeiomatarion`, category Developer Tools, copyright, export-compliance flag and a privacy manifest (`PrivacyInfo.xcprivacy`).
 
 ### Changed
 
-- The app is named Simeiomatarion.
+- The app is named Simeiomatarion, with its own icon. The executable is `Simeiomatarion` and settings live in `~/Library/Application Support/Simeiomatarion` (copied once from the earlier folder).
 - A prompt confirms before closing documents. Preferences can turn it off.
 
 [Unreleased]: https://github.com/konstantinosdimitriou-streamcode/Simeiomatarion/compare/v1.0.0...dev

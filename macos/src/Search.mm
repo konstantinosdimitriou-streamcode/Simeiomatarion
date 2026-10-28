@@ -13,7 +13,7 @@ long NppSearchFlags(SearchFlags flags) {
 		value |= SCFIND_WHOLEWORD;
 	}
 	if (flags.regex) {
-		// Same POSIX Boost expression flags Notepad++ uses for regular-expression search.
+		// POSIX Boost expression flags for regular-expression search.
 		value |= SCFIND_REGEXP | SCFIND_POSIX | SCFIND_REGEXP_SKIPCRLFASONE;
 		if (flags.dotMatchesNewline) {
 			value |= SCFIND_REGEXP_DOTMATCHESNL;

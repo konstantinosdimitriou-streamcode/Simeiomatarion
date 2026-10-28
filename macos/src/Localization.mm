@@ -30,6 +30,8 @@ static NSDictionary<NSString *, NSString *> *GreekTable(void) {
 	dispatch_once(&once, ^{
 		table = @{
 			@"About Simeiomatarion": @"Περί του Simeiomatarion",
+			@"Acknowledgements…": @"Ευχαριστίες και άδειες…",
+			@"Acknowledgements / Licenses": @"Ευχαριστίες / Άδειες",
 			@"Add Next Occurrence": @"Πρόσθεσε την επόμενη εμφάνιση",
 			@"Always on Top": @"Πάντα από πάνω",
 			@"Appearance": @"Εμφάνιση",

@@ -538,11 +538,30 @@ static long NppZoomColumnPosition(ScintillaView *editor, long line, long visualC
 @implementation NppTabChip
 @end
 
+// Folder name used by builds before 1.0.0. Only read, once, to copy old settings.
+static NSString *const kLegacySupportFolderName = @"NotepadPlusPlus";
+
 static NSURL *SupportDirectory(void) {
-	NSFileManager *files = [NSFileManager defaultManager];
-	NSURL *base = [files URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
-	NSURL *directory = [base URLByAppendingPathComponent:@"NotepadPlusPlus" isDirectory:YES];
-	[files createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	static NSURL *directory;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSFileManager *files = [NSFileManager defaultManager];
+		NSURL *base = [files URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+		directory = [base URLByAppendingPathComponent:@"Simeiomatarion" isDirectory:YES];
+		if (![files fileExistsAtPath:directory.path]) {
+			// One-time migration: copy (never move) the pre-1.0.0 folder. Under the App Sandbox
+			// the old folder is outside the container and simply is not there, so this is skipped.
+			NSURL *legacy = [base URLByAppendingPathComponent:kLegacySupportFolderName isDirectory:YES];
+			BOOL isDirectory = NO;
+			if ([files fileExistsAtPath:legacy.path isDirectory:&isDirectory] && isDirectory && [files isReadableFileAtPath:legacy.path]) {
+				NSError *error = nil;
+				if (![files copyItemAtURL:legacy toURL:directory error:&error]) {
+					NSLog(@"Simeiomatarion: could not copy old settings: %@", error.localizedDescription);
+				}
+			}
+		}
+		[files createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
+	});
 	return directory;
 }
 
@@ -2645,6 +2664,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	dispatch_once(&once, ^{
 		symbols = @{
 			@"About Simeiomatarion": @"info.circle",
+			@"Acknowledgements…": @"doc.text",
 			@"Add Next Occurrence": @"plus.magnifyingglass",
 			@"All": @"square.and.arrow.down.on.square",
 			@"Always on Top": @"pin",
@@ -2865,6 +2885,7 @@ static NSString *NppMenuSymbol(NSString *title) {
 	NSMenu *bar = [NSMenu new];
 	NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Simeiomatarion"];
 	[appMenu addItem:[self item:@"About Simeiomatarion" action:@selector(showAbout:) command:nil]];
+	[appMenu addItem:[self item:@"Acknowledgements…" action:@selector(showAcknowledgements:) command:nil]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
 	[appMenu addItem:[self item:@"Preferences…" action:@selector(showPreferences:) command:@"preferences"]];
 	[appMenu addItem:[NSMenuItem separatorItem]];
@@ -5920,14 +5941,45 @@ static NSString *NppMenuSymbol(NSString *title) {
 	[self refreshStatus];
 }
 
+static NSString *const kSourceURL = @"https://github.com/konstantinosdimitriou-streamcode/Simeiomatarion";
+
 - (void)showAbout:(id)sender {
 	(void)sender;
-	NSAlert *alert = [NSAlert new];
 	NSDictionary *info = NSBundle.mainBundle.infoDictionary;
 	NSString *version = info[@"CFBundleShortVersionString"] ?: @"?";
 	NSString *build = info[@"CFBundleVersion"] ?: @"?";
+	NSString *copyright = info[@"NSHumanReadableCopyright"] ?: @"";
+	NSAlert *alert = [NSAlert new];
 	alert.messageText = @"Simeiomatarion";
-	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.", version, build];
+	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText and code editor for Apple Silicon.\n\n%@\nSource code: %@", version, build, copyright, kSourceURL];
+	[alert addButtonWithTitle:NppL(@"OK")];
+	[alert addButtonWithTitle:NppL(@"Acknowledgements…")];
+	if ([alert runModal] == NSAlertSecondButtonReturn) {
+		[self showAcknowledgements:nil];
+	}
+}
+
+- (void)showAcknowledgements:(id)sender {
+	(void)sender;
+	NSURL *url = [NSBundle.mainBundle URLForResource:@"NOTICE" withExtension:nil];
+	NSString *notice = url ? [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:nil] : nil;
+	if (!notice.length) {
+		notice = [NSString stringWithFormat:@"Licensed under the GNU GPL v3. See %@", kSourceURL];
+	}
+	NSAlert *alert = [NSAlert new];
+	alert.messageText = NppL(@"Acknowledgements / Licenses");
+	alert.informativeText = [NSString stringWithFormat:@"Copyright notices and licenses. The complete source code is available under the GNU GPL v3 at %@", kSourceURL];
+	NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 560, 320)];
+	scroll.hasVerticalScroller = YES;
+	scroll.borderType = NSBezelBorder;
+	NSTextView *text = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 560, 320)];
+	text.editable = NO;
+	text.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+	text.string = notice;
+	text.autoresizingMask = NSViewWidthSizable;
+	text.textContainer.widthTracksTextView = YES;
+	scroll.documentView = text;
+	alert.accessoryView = scroll;
 	[alert runModal];
 }
 

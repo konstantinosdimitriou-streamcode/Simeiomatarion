@@ -1,4 +1,4 @@
-/* Minimal stand-in so Notepad++'s LexUser.cxx can compile on macOS.
+/* Minimal stand-in so the upstream LexUser.cxx can compile on macOS.
    The lexer includes windows.h for the MSVC _itoa helper only. */
 #pragma once
 
