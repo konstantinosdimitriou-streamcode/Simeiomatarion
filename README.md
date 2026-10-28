@@ -24,6 +24,8 @@ open "build/Simeiomatarion.app"
 
 `make test` also runs `build/port_tests`.
 
+The version is in [`VERSION`](VERSION) and the build number in [`BUILD_NUMBER`](BUILD_NUMBER). See [Version in macos/README.md](macos/README.md#version) for how to bump it, and [`CHANGELOG.md`](CHANGELOG.md) for what changed.
+
 ## What you can do
 
 - Edit several documents in tabs

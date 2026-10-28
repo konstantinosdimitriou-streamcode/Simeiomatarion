@@ -9,9 +9,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>org.notepad-plus-plus.macos</string>
 	<key>CFBundleVersion</key>
-	<string>8.9.8.1</string>
+	<string>@BUILD_NUMBER@</string>
 	<key>CFBundleShortVersionString</key>
-	<string>8.9.8.1</string>
+	<string>@VERSION@</string>
 	<key>CFBundleExecutable</key>
 	<string>NotepadPlusPlus</string>
 	<key>CFBundleIconFile</key>
