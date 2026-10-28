@@ -11,6 +11,7 @@
 
 @protocol DocumentTabDelegate <NSObject>
 - (void)documentTabDidChange:(DocumentTab *)tab;
+- (void)documentTabDidScroll:(DocumentTab *)tab;
 - (void)documentTab:(DocumentTab *)tab insertedText:(NSString *)text at:(NSInteger)position;
 - (void)documentTab:(DocumentTab *)tab deletedText:(NSString *)text at:(NSInteger)position;
 @end
@@ -26,7 +27,11 @@
 @property (nonatomic, copy) NSString *language;
 @property (nonatomic, copy) NSString *lexerName;
 @property (nonatomic, assign) BOOL suppressMacro;
+@property (nonatomic, assign) BOOL pinned;
 @property (nonatomic, assign) BOOL fileMonitoring;
+- (ScintillaView *)mirrorView;
+- (ScintillaView *)existingMirror;
+- (void)discardMirror;
 @property (nonatomic, copy) NSDate *observedModificationDate;
 @property (nonatomic, assign) unsigned long long observedFileSize;
 @property (nonatomic, assign) BOOL missingOnDiskNoted;

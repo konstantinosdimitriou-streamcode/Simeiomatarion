@@ -33,6 +33,9 @@ static int KeywordIndex(NSString *name) {
 	NSMutableArray<NSString *> *_keywordStorage;
 	dispatch_source_t _monitor;
 	int _monitorFD;
+	ScintillaView *_mirror;
+	BOOL _pairing;
+	BOOL _spellEcho;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -51,6 +54,8 @@ static int KeywordIndex(NSString *name) {
 		[_editor message:SCI_SETEOLMODE wParam:SC_EOL_LF lParam:0];
 		[_editor message:SCI_SETMULTIPLESELECTION wParam:1 lParam:0];
 		[_editor message:SCI_SETADDITIONALSELECTIONTYPING wParam:1 lParam:0];
+		[_editor message:SCI_SETMULTIPASTE wParam:SC_MULTIPASTE_EACH lParam:0];
+		[_editor message:SCI_SETADDITIONALCARETSVISIBLE wParam:1 lParam:0];
 		[_editor message:SCI_SETCHANGEHISTORY wParam:SC_CHANGE_HISTORY_DISABLED lParam:0];
 		[_editor message:SCI_SETMARGINMASKN wParam:2 lParam:SC_MASK_FOLDERS];
 		[_editor message:SCI_SETMARGINSENSITIVEN wParam:2 lParam:1];
@@ -70,6 +75,9 @@ static int KeywordIndex(NSString *name) {
 
 - (NSString *)title {
 	NSString *name = self.displayName.length ? self.displayName : @"Untitled";
+	if (self.pinned) {
+		name = [@"📌 " stringByAppendingString:name];
+	}
 	if (self.fileMonitoring) {
 		name = [name stringByAppendingString:@"  [tail]"];
 	}
@@ -78,9 +86,16 @@ static int KeywordIndex(NSString *name) {
 
 - (void)setUtf8Text:(NSString *)text {
 	self.suppressMacro = YES;
+	sptr_t readonly = [self.editor message:SCI_GETREADONLY];
+	if (readonly) {
+		[self.editor message:SCI_SETREADONLY wParam:0 lParam:0];
+	}
 	[self.editor setString:text ?: @""];
 	[self.editor message:SCI_EMPTYUNDOBUFFER];
 	[self.editor message:SCI_COLOURISE wParam:0 lParam:-1];
+	if (readonly) {
+		[self.editor message:SCI_SETREADONLY wParam:1 lParam:0];
+	}
 	self.suppressMacro = NO;
 	[self markClean];
 }
@@ -101,6 +116,62 @@ static int KeywordIndex(NSString *name) {
 		dispatch_source_cancel(_monitor);
 		_monitor = nil;
 	}
+	_mirror.delegate = nil;
+	_mirror = nil;
+}
+
+- (void)applyChromeTo:(ScintillaView *)editor settings:(EditorSettings *)settings {
+	[editor setFontName:settings.fontName ?: @"Menlo" size:settings.fontSize bold:NO italic:NO];
+	[editor message:SCI_SETTABWIDTH wParam:static_cast<uptr_t>(MAX(1, settings.tabWidth)) lParam:0];
+	[editor message:SCI_SETUSETABS wParam:settings.useTabs ? 1 : 0 lParam:0];
+	[editor message:SCI_SETWRAPMODE wParam:settings.wrap ? 1 : 0 lParam:0];
+	[editor message:SCI_SETMARGINWIDTHN wParam:0 lParam:settings.lineNumbers ? 46 : 0];
+	[editor message:SCI_SETMARGINTYPEN wParam:0 lParam:SC_MARGIN_NUMBER];
+	[editor message:SCI_SETMARGINTYPEN wParam:1 lParam:SC_MARGIN_SYMBOL];
+	[editor message:SCI_SETMARGINWIDTHN wParam:1 lParam:16];
+	[editor message:SCI_SETMARGINMASKN wParam:1 lParam:(1 << 20)];
+	[editor message:SCI_MARKERDEFINE wParam:20 lParam:SC_MARK_BOOKMARK];
+	[editor message:SCI_SETMARGINWIDTHN wParam:2 lParam:16];
+	[editor message:SCI_SETVIEWWS wParam:settings.showWhitespace ? SCWS_VISIBLEALWAYS : SCWS_INVISIBLE lParam:0];
+	[editor message:SCI_SETEOLMODE wParam:static_cast<uptr_t>(self.eolMode) lParam:0];
+	[editor message:SCI_SETCHANGEHISTORY wParam:settings.showChanges ? SC_CHANGE_HISTORY_MARKERS : SC_CHANGE_HISTORY_DISABLED lParam:0];
+	[editor message:SCI_SETMARGINTYPEN wParam:3 lParam:SC_MARGIN_SYMBOL];
+	[editor message:SCI_SETMARGINMASKN wParam:3 lParam:SC_MASK_HISTORY];
+	[editor message:SCI_SETMARGINWIDTHN wParam:3 lParam:settings.showChanges ? 8 : 0];
+	[editor message:SCI_INDICSETSTYLE wParam:11 lParam:INDIC_SQUIGGLE];
+	[editor message:SCI_INDICSETFORE wParam:11 lParam:0x0000FF];
+	[editor message:SCI_SETMULTIPLESELECTION wParam:1 lParam:0];
+	[editor message:SCI_SETADDITIONALSELECTIONTYPING wParam:1 lParam:0];
+	[editor message:SCI_SETMULTIPASTE wParam:SC_MULTIPASTE_EACH lParam:0];
+	[editor message:SCI_SETADDITIONALCARETSVISIBLE wParam:1 lParam:0];
+}
+
+- (ScintillaView *)existingMirror {
+	return _mirror;
+}
+
+- (ScintillaView *)mirrorView {
+	if (_mirror) {
+		return _mirror;
+	}
+	_mirror = [[ScintillaView alloc] initWithFrame:NSZeroRect];
+	_mirror.delegate = self;
+	_mirror.clipsToBounds = YES;
+	_mirror.autoresizingMask = NSViewNotSizable;
+	sptr_t document = [self.editor message:SCI_GETDOCPOINTER wParam:0 lParam:0];
+	[self.editor message:SCI_ADDREFDOCUMENT wParam:0 lParam:document];
+	[_mirror message:SCI_SETDOCPOINTER wParam:0 lParam:document];
+	if (_settings) {
+		[self applyChromeTo:_mirror settings:_settings];
+	}
+	[self restyleEditor:_mirror];
+	return _mirror;
+}
+
+- (void)discardMirror {
+	_mirror.delegate = nil;
+	[_mirror removeFromSuperview];
+	_mirror = nil;
 }
 
 - (void)setFileMonitoring:(BOOL)enabled {
@@ -151,6 +222,10 @@ static int KeywordIndex(NSString *name) {
 	if (self.path.length == 0) {
 		return;
 	}
+	NSString *extension = self.path.pathExtension.lowercaseString;
+	if ([extension isEqualToString:@"pdf"] || [extension isEqualToString:@"doc"] || [extension isEqualToString:@"docx"] || [extension isEqualToString:@"xlsx"]) {
+		return;
+	}
 	NSData *data = [NSData dataWithContentsOfFile:self.path];
 	if (!data) {
 		return;
@@ -179,20 +254,10 @@ static int KeywordIndex(NSString *name) {
 - (void)applySettings:(EditorSettings *)settings dark:(BOOL)dark {
 	_settings = settings;
 	_dark = dark;
-	ScintillaView *editor = self.editor;
-	[editor setFontName:settings.fontName ?: @"Menlo" size:settings.fontSize bold:NO italic:NO];
-	[editor message:SCI_SETTABWIDTH wParam:static_cast<uptr_t>(MAX(1, settings.tabWidth)) lParam:0];
-	[editor message:SCI_SETUSETABS wParam:settings.useTabs ? 1 : 0 lParam:0];
-	[editor message:SCI_SETWRAPMODE wParam:settings.wrap ? 1 : 0 lParam:0];
-	[editor message:SCI_SETMARGINWIDTHN wParam:0 lParam:settings.lineNumbers ? 46 : 0];
-	[editor message:SCI_SETMARGINTYPEN wParam:0 lParam:SC_MARGIN_NUMBER];
-	[editor message:SCI_SETMARGINTYPEN wParam:1 lParam:SC_MARGIN_SYMBOL];
-	[editor message:SCI_SETMARGINWIDTHN wParam:1 lParam:16];
-	[editor message:SCI_SETMARGINMASKN wParam:1 lParam:(1 << 20)];
-	[editor message:SCI_MARKERDEFINE wParam:20 lParam:SC_MARK_BOOKMARK];
-	[editor message:SCI_SETMARGINWIDTHN wParam:2 lParam:16];
-	[editor message:SCI_SETVIEWWS wParam:settings.showWhitespace ? SCWS_VISIBLEALWAYS : SCWS_INVISIBLE lParam:0];
-	[editor message:SCI_SETEOLMODE wParam:static_cast<uptr_t>(self.eolMode) lParam:0];
+	[self applyChromeTo:self.editor settings:settings];
+	if (_mirror) {
+		[self applyChromeTo:_mirror settings:settings];
+	}
 	[self restyle];
 }
 
@@ -247,7 +312,13 @@ static int KeywordIndex(NSString *name) {
 }
 
 - (void)restyle {
-	ScintillaView *editor = self.editor;
+	[self restyleEditor:self.editor];
+	if (_mirror) {
+		[self restyleEditor:_mirror];
+	}
+}
+
+- (void)restyleEditor:(ScintillaView *)editor {
 	NSColor *background = _dark ? SRGB(30, 30, 30) : NSColor.whiteColor;
 	NSColor *foreground = _dark ? SRGB(212, 212, 212) : NSColor.blackColor;
 	[editor setColorProperty:SCI_STYLESETFORE parameter:STYLE_DEFAULT value:foreground];
@@ -301,7 +372,183 @@ static int KeywordIndex(NSString *name) {
 		[self.editor message:SCI_TOGGLEFOLD wParam:(uptr_t)line lParam:0];
 	} else if (notification->nmhdr.code == SCN_UPDATEUI) {
 		[self highlightBraces];
-		[self.delegate documentTabDidChange:self];
+		int updated = notification->updated;
+		if ((updated & SC_UPDATE_V_SCROLL) && [self.delegate respondsToSelector:@selector(documentTabDidScroll:)]) {
+			[self.delegate documentTabDidScroll:self];
+		}
+		if (updated & (SC_UPDATE_CONTENT | SC_UPDATE_SELECTION)) {
+			if (_spellEcho) {
+				return;
+			}
+			[self.delegate documentTabDidChange:self];
+			if (_settings.spellCheck) {
+				[NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(refreshSpelling) object:nil];
+				[self performSelector:@selector(refreshSpelling) withObject:nil afterDelay:0.35];
+			}
+		}
+	} else if (notification->nmhdr.code == SCN_CHARADDED && !_pairing) {
+		[self handleTypedCharacter:notification->ch];
+	}
+}
+
+- (NSString *)textFrom:(long)start to:(long)end {
+	if (end <= start) {
+		return @"";
+	}
+	long length = MIN(end - start, 12000);
+	std::string buffer(static_cast<size_t>(length) + 1, '\0');
+	Sci_TextRangeFull range;
+	range.chrg.cpMin = start;
+	range.chrg.cpMax = start + length;
+	range.lpstrText = buffer.data();
+	[self.editor message:SCI_GETTEXTRANGEFULL wParam:0 lParam:(sptr_t)&range];
+	NSString *text = nil;
+	NSUInteger count = (NSUInteger)length;
+	while (count > 0 && !text) {
+		text = [[NSString alloc] initWithBytes:buffer.data() length:count encoding:NSUTF8StringEncoding];
+		if (!text) {
+			count--;
+		}
+	}
+	return text ?: @"";
+}
+
+- (void)insertText:(NSString *)text at:(long)position caret:(long)caret {
+	const char *bytes = text.UTF8String ?: "";
+	_pairing = YES;
+	self.suppressMacro = YES;
+	[self.editor message:SCI_INSERTTEXT wParam:(uptr_t)position lParam:(sptr_t)bytes];
+	[self.editor message:SCI_GOTOPOS wParam:(uptr_t)caret lParam:0];
+	self.suppressMacro = NO;
+	_pairing = NO;
+}
+
+- (void)handleTypedCharacter:(int)character {
+	if (!_settings) {
+		return;
+	}
+	BOOL newline = character == '\n' || character == '\r';
+	if (newline && _settings.smartIndent) {
+		if (character == '\r' && self.eolMode != SC_EOL_CR) {
+			return;
+		}
+		if (character == '\n' && self.eolMode == SC_EOL_CR) {
+			return;
+		}
+		[self indentAfterEnter];
+		return;
+	}
+	if (!_settings.autoClose || newline) {
+		return;
+	}
+	NSString *typed = [NSString stringWithFormat:@"%c", character];
+	NSDictionary<NSString *, NSString *> *pairs = @{@"(": @")", @"[": @"]", @"{": @"}", @"\"": @"\"", @"'": @"'"};
+	long position = [self.editor message:SCI_GETCURRENTPOS];
+	if ([@")]}'\"" containsString:typed]) {
+		long next = [self.editor message:SCI_GETCHARAT wParam:(uptr_t)position lParam:0];
+		if (next == character && position > 0) {
+			_pairing = YES;
+			[self.editor message:SCI_DELETERANGE wParam:(uptr_t)(position - 1) lParam:1];
+			_pairing = NO;
+		}
+		return;
+	}
+	NSString *closer = pairs[typed];
+	if (!closer) {
+		return;
+	}
+	if ((character == '"' || character == '\'') && position > 1) {
+		long previous = [self.editor message:SCI_GETCHARAT wParam:(uptr_t)(position - 2) lParam:0];
+		if ((previous >= '0' && previous <= '9') || (previous >= 'A' && previous <= 'Z') || (previous >= 'a' && previous <= 'z') || previous == '_') {
+			return;
+		}
+	}
+	[self insertText:closer at:position caret:position];
+}
+
+- (void)indentAfterEnter {
+	long position = [self.editor message:SCI_GETCURRENTPOS];
+	long line = [self.editor message:SCI_LINEFROMPOSITION wParam:(uptr_t)position lParam:0];
+	if (line <= 0) {
+		return;
+	}
+	long previousStart = [self.editor message:SCI_POSITIONFROMLINE wParam:(uptr_t)(line - 1) lParam:0];
+	long previousEnd = [self.editor message:SCI_GETLINEENDPOSITION wParam:(uptr_t)(line - 1) lParam:0];
+	NSString *previous = [self textFrom:previousStart to:previousEnd];
+	NSUInteger index = 0;
+	while (index < previous.length) {
+		unichar value = [previous characterAtIndex:index];
+		if (value != ' ' && value != '\t') {
+			break;
+		}
+		index++;
+	}
+	NSString *indent = [previous substringToIndex:index];
+	NSString *trimmed = [previous stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+	BOOL opens = trimmed.length && ([trimmed hasSuffix:@"{"] || [trimmed hasSuffix:@"("] || [trimmed hasSuffix:@"["] || [trimmed hasSuffix:@":"]);
+	NSString *extra = @"";
+	if (opens) {
+		extra = _settings.useTabs ? @"\t" : [@"" stringByPaddingToLength:MAX(1, _settings.tabWidth) withString:@" " startingAtIndex:0];
+	}
+	long next = [self.editor message:SCI_GETCHARAT wParam:(uptr_t)position lParam:0];
+	BOOL closes = next == '}' || next == ')' || next == ']';
+	NSString *insertion = [indent stringByAppendingString:extra];
+	long caret = position + (long)[insertion lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+	if (opens && closes) {
+		insertion = [NSString stringWithFormat:@"%@\n%@", insertion, indent];
+	}
+	if (insertion.length == 0) {
+		return;
+	}
+	[self insertText:insertion at:position caret:caret];
+}
+
+- (void)refreshSpelling {
+	ScintillaView *editor = self.editor;
+	long length = [editor message:SCI_GETLENGTH];
+	_spellEcho = YES;
+	[editor message:SCI_SETINDICATORCURRENT wParam:11 lParam:0];
+	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+	__weak DocumentTab *weakSelf = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		DocumentTab *strongSelf = weakSelf;
+		strongSelf->_spellEcho = NO;
+	});
+	if (!_settings.spellCheck) {
+		return;
+	}
+	BOOL prose = [self.lexerName isEqualToString:@"null"] || [self.lexerName isEqualToString:@"markdown"] || [self.language isEqualToString:@"normal"] || [self.language isEqualToString:@"markdown"];
+	if (!prose) {
+		return;
+	}
+	long firstDisplay = [editor message:SCI_GETFIRSTVISIBLELINE];
+	long startLine = [editor message:SCI_DOCLINEFROMVISIBLE wParam:(uptr_t)firstDisplay lParam:0];
+	long lastLine = MIN([editor message:SCI_GETLINECOUNT] - 1, startLine + [editor message:SCI_LINESONSCREEN] + 1);
+	long start = [editor message:SCI_POSITIONFROMLINE wParam:(uptr_t)MAX(0, startLine) lParam:0];
+	long end = [editor message:SCI_GETLINEENDPOSITION wParam:(uptr_t)MAX(0, lastLine) lParam:0];
+	if (end - start > 12000) {
+		end = start + 12000;
+	}
+	NSString *text = [self textFrom:start to:end];
+	if (text.length == 0) {
+		return;
+	}
+	NSSpellChecker *checker = [NSSpellChecker sharedSpellChecker];
+	NSInteger location = 0;
+	while (location < (NSInteger)text.length) {
+		NSRange range = [checker checkSpellingOfString:text startingAt:location language:nil wrap:NO inSpellDocumentWithTag:0 wordCount:NULL];
+		if (range.location == NSNotFound || range.length == 0) {
+			break;
+		}
+		NSString *prefix = [text substringToIndex:range.location];
+		NSString *word = [text substringWithRange:range];
+		long byteStart = start + (long)[prefix lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+		long byteLength = (long)[word lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+		[editor message:SCI_INDICATORFILLRANGE wParam:(uptr_t)byteStart lParam:byteLength];
+		location = (NSInteger)NSMaxRange(range);
+		if (location <= (NSInteger)range.location) {
+			break;
+		}
 	}
 }
 

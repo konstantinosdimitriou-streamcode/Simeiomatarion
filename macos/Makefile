@@ -12,13 +12,13 @@ LEX_INCLUDES := -Icompat -I$(UP)/lexilla/include -I$(UP)/lexilla/lexlib -I$(UP)/
 APP_INCLUDES := -Isrc $(SCI_INCLUDES) -I$(UP)/lexilla/include -I$(UP)/scintilla/cocoa
 OBJCXX := $(CXXFLAGS) -fobjc-arc -Wall -Wextra -Wno-unused-parameter
 PREFIX := -include src/sdk_prefix.h
-APP := build/Notepad++.app
+APP := build/Simeiomatarion.app
 
 SCI_SRC := $(wildcard $(UP)/scintilla/src/*.cxx)
 COCOA_SRC := $(UP)/scintilla/cocoa/PlatCocoa.mm $(UP)/scintilla/cocoa/ScintillaCocoa.mm $(UP)/scintilla/cocoa/ScintillaView.mm $(UP)/scintilla/cocoa/InfoBar.mm
 BOOST_SRC := $(UP)/boostregex/BoostRegExSearch.cxx $(UP)/boostregex/UTF8DocumentIterator.cxx
 LEX_SRC := $(wildcard $(UP)/lexilla/src/*.cxx) $(wildcard $(UP)/lexilla/lexlib/*.cxx) $(wildcard $(UP)/lexilla/lexers/*.cxx)
-APP_MM := src/main.mm src/AppDelegate.mm src/DocumentTab.mm src/Search.mm src/LangCatalog.mm src/EditorSettings.mm src/MacroStore.mm src/EditorActions.mm src/StyleTheme.mm
+APP_MM := src/main.mm src/AppDelegate.mm src/DocumentTab.mm src/Search.mm src/LangCatalog.mm src/EditorSettings.mm src/MacroStore.mm src/EditorActions.mm src/StyleTheme.mm src/OutlineIndex.mm src/SnippetStore.mm src/PreviewHTML.mm src/UserLanguages.mm src/ClipboardHistory.mm src/MinimapView.mm src/Localization.mm src/TextTools.mm src/OfficeOpen.mm
 APP_CC := src/Encoding.cc
 
 SCI_OBJ := $(patsubst $(UP)/scintilla/src/%.cxx,build/obj/sci/%.o,$(SCI_SRC))
@@ -29,7 +29,7 @@ LEX_OBJ := $(patsubst $(UP)/lexilla/src/%.cxx,build/obj/lex/src/%.o,$(filter $(U
 	$(patsubst $(UP)/lexilla/lexers/%.cxx,build/obj/lex/lexers/%.o,$(filter $(UP)/lexilla/lexers/%,$(LEX_SRC)))
 APP_OBJ := $(patsubst src/%.mm,build/obj/app/%.o,$(APP_MM)) $(patsubst src/%.cc,build/obj/app/%.o,$(APP_CC))
 ENGINE_OBJ := $(SCI_OBJ) $(COCOA_OBJ) $(BOOST_OBJ) $(LEX_OBJ)
-TEST_OBJ := build/obj/app/port_tests.o build/obj/app/Encoding.o build/obj/app/LangCatalog.o build/obj/app/Search.o build/obj/app/EditorActions.o build/obj/app/EditorSettings.o build/obj/app/StyleTheme.o build/obj/app/DocumentTab.o
+TEST_OBJ := build/obj/app/port_tests.o build/obj/app/Encoding.o build/obj/app/LangCatalog.o build/obj/app/Search.o build/obj/app/EditorActions.o build/obj/app/EditorSettings.o build/obj/app/StyleTheme.o build/obj/app/DocumentTab.o build/obj/app/OutlineIndex.o build/obj/app/SnippetStore.o build/obj/app/PreviewHTML.o build/obj/app/UserLanguages.o build/obj/app/ClipboardHistory.o build/obj/app/Localization.o build/obj/app/TextTools.o build/obj/app/OfficeOpen.o
 
 .PHONY: all clean test resources plugin
 
@@ -74,10 +74,10 @@ build/obj/app/port_tests.o: tests/port_tests.mm
 
 $(APP)/Contents/MacOS/NotepadPlusPlus: $(APP_OBJ) $(ENGINE_OBJ)
 	@mkdir -p $(dir $@)
-	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -liconv -o $@
+	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework WebKit -framework PDFKit -liconv -lz -o $@
 
 build/port_tests: $(TEST_OBJ) $(ENGINE_OBJ)
-	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -liconv -o $@
+	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework PDFKit -liconv -lz -o $@
 
 $(APP)/Contents/Info.plist: Info.plist
 	@mkdir -p $(APP)/Contents
@@ -87,7 +87,7 @@ $(APP)/Contents/PkgInfo:
 	@mkdir -p $(APP)/Contents
 	printf 'APPL????' > $@
 
-ICON_SRC := $(UP)/PowerEditor/src/icons/npp.ico
+ICON_SRC := resources/AppIcon.jpg
 ICONSET := build/AppIcon.iconset
 
 $(APP)/Contents/Resources/AppIcon.icns: $(ICON_SRC)
