@@ -14,6 +14,11 @@ OBJCXX := $(CXXFLAGS) -fobjc-arc -Wall -Wextra -Wno-unused-parameter
 PREFIX := -include src/sdk_prefix.h
 APP := build/Simeiomatarion.app
 
+# Version: ../VERSION (semver) and ../BUILD_NUMBER are the single source of truth.
+# Override on the command line for CI, e.g. `make BUILD_NUMBER=42`.
+VERSION := $(strip $(shell cat ../VERSION))
+BUILD_NUMBER := $(strip $(shell cat ../BUILD_NUMBER))
+
 SCI_SRC := $(wildcard $(UP)/scintilla/src/*.cxx)
 COCOA_SRC := $(UP)/scintilla/cocoa/PlatCocoa.mm $(UP)/scintilla/cocoa/ScintillaCocoa.mm $(UP)/scintilla/cocoa/ScintillaView.mm $(UP)/scintilla/cocoa/InfoBar.mm
 BOOST_SRC := $(UP)/boostregex/BoostRegExSearch.cxx $(UP)/boostregex/UTF8DocumentIterator.cxx
@@ -31,7 +36,10 @@ APP_OBJ := $(patsubst src/%.mm,build/obj/app/%.o,$(APP_MM)) $(patsubst src/%.cc,
 ENGINE_OBJ := $(SCI_OBJ) $(COCOA_OBJ) $(BOOST_OBJ) $(LEX_OBJ)
 TEST_OBJ := build/obj/app/port_tests.o build/obj/app/Encoding.o build/obj/app/LangCatalog.o build/obj/app/Search.o build/obj/app/EditorActions.o build/obj/app/EditorSettings.o build/obj/app/StyleTheme.o build/obj/app/DocumentTab.o build/obj/app/OutlineIndex.o build/obj/app/SnippetStore.o build/obj/app/PreviewHTML.o build/obj/app/UserLanguages.o build/obj/app/ClipboardHistory.o build/obj/app/Localization.o build/obj/app/TextTools.o build/obj/app/OfficeOpen.o
 
-.PHONY: all clean test resources plugin
+.PHONY: all clean test resources plugin version $(APP)/Contents/Info.plist
+
+version:
+	@echo "$(VERSION) ($(BUILD_NUMBER))"
 
 all: $(APP)/Contents/MacOS/NotepadPlusPlus $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin build/port_tests
 	codesign --force --sign - $(APP)
@@ -79,9 +87,12 @@ $(APP)/Contents/MacOS/NotepadPlusPlus: $(APP_OBJ) $(ENGINE_OBJ)
 build/port_tests: $(TEST_OBJ) $(ENGINE_OBJ)
 	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework PDFKit -liconv -lz -o $@
 
-$(APP)/Contents/Info.plist: Info.plist
+$(APP)/Contents/Info.plist: Info.plist ../VERSION ../BUILD_NUMBER
 	@mkdir -p $(APP)/Contents
-	cp $< $@
+	@echo "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$$' || { echo "VERSION must be MAJOR.MINOR.PATCH, got '$(VERSION)'"; exit 1; }
+	@echo "$(BUILD_NUMBER)" | grep -Eq '^[0-9]+$$' || { echo "BUILD_NUMBER must be a positive integer, got '$(BUILD_NUMBER)'"; exit 1; }
+	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@BUILD_NUMBER@/$(BUILD_NUMBER)/g' $< > $@
+	plutil -lint $@
 
 $(APP)/Contents/PkgInfo:
 	@mkdir -p $(APP)/Contents

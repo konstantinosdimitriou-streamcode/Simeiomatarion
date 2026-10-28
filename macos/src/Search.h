@@ -17,6 +17,8 @@ long NppReplace(ScintillaView *editor, NSString *text, NSString *replacement, bo
 long NppReplaceAll(ScintillaView *editor, NSString *text, NSString *replacement, SearchFlags flags);
 void NppHighlightMatches(ScintillaView *editor, NSString *text, SearchFlags flags);
 void NppClearSearchHighlights(ScintillaView *editor);
+// Marks one match and scrolls it into view. A negative start clears the mark.
+void NppShowCurrentMatch(ScintillaView *editor, long start, long end);
 
 @interface NppFindHit : NSObject
 @property (nonatomic, copy) NSString *path;

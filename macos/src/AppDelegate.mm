@@ -1615,6 +1615,9 @@ static NSArray<NSDictionary *> *NppDiffLines(NSArray<NSString *> *left, NSArray<
 	NSTableView *_quickOpenTable;
 	NSArray *_quickOpenRows;
 	BOOL _syncingScroll;
+	ScintillaView *_findMarkEditor;
+	long _findMarkStart;
+	long _findMarkEnd;
 	BOOL _closingWithoutPrompt;
 	BOOL _discardUnsavedSession;
 	NSView *_compareBar;
@@ -4621,6 +4624,20 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)hideFind:(id)sender {
 	(void)sender;
 	_workspace.findVisible = NO;
+	ScintillaView *editor = _findMarkEditor ?: [self activeEditor];
+	long markedStart = _findMarkStart;
+	long markedEnd = _findMarkEnd;
+	_findMarkEditor = nil;
+	_findMarkStart = -1;
+	_findMarkEnd = -1;
+	NppClearSearchHighlights(editor);
+	if (editor && markedEnd > markedStart) {
+		long start = [editor message:SCI_GETSELECTIONSTART];
+		long end = [editor message:SCI_GETSELECTIONEND];
+		if (start == markedStart && end == markedEnd) {
+			[editor message:SCI_SETSEL wParam:(uptr_t)end lParam:end];
+		}
+	}
 	[_workspace layoutPanes];
 	DocumentTab *document = [self currentDocument];
 	if (document.editor) {
@@ -4645,6 +4662,9 @@ static NSString *NppMenuSymbol(NSString *title) {
 			_findField.stringValue = selected;
 		}
 	}
+	if (_workspace.resultsVisible) {
+		[self hideFindInFiles:nil];
+	}
 	_workspace.findVisible = YES;
 	[_workspace layoutPanes];
 	[self layoutFindBar];
@@ -4666,6 +4686,10 @@ static NSString *NppMenuSymbol(NSString *title) {
 	}
 	if (replacing) {
 		_filesReplace.stringValue = _replaceField.stringValue;
+	}
+	if (_workspace.findVisible) {
+		_workspace.findVisible = NO;
+		[self revealCurrentMatch:-1 end:-1 inEditor:[self activeEditor]];
 	}
 	_workspace.resultsVisible = YES;
 	[_workspace layoutPanes];
@@ -5276,20 +5300,58 @@ static NSString *NppMenuSymbol(NSString *title) {
 	_window.level = _window.level == NSFloatingWindowLevel ? NSNormalWindowLevel : NSFloatingWindowLevel;
 }
 
+- (void)revealCurrentMatch:(long)start end:(long)end inEditor:(ScintillaView *)editor {
+	if (!editor || start < 0 || end <= start) {
+		if (!editor || editor == _findMarkEditor) {
+			_findMarkEditor = nil;
+			_findMarkStart = -1;
+			_findMarkEnd = -1;
+		}
+		NppShowCurrentMatch(editor, -1, -1);
+		return;
+	}
+	_findMarkEditor = editor;
+	_findMarkStart = start;
+	_findMarkEnd = end;
+	NppShowCurrentMatch(editor, start, end);
+}
+
+- (void)reportFind:(long)found inEditor:(ScintillaView *)editor {
+	[self noteSearch:_findField.stringValue inEditor:editor];
+	if (found < 0) {
+		[self revealCurrentMatch:-1 end:-1 inEditor:editor];
+		[self setStatusText:@"No match."];
+		return;
+	}
+	long start = [editor message:SCI_GETSELECTIONSTART];
+	long end = [editor message:SCI_GETSELECTIONEND];
+	[self revealCurrentMatch:start end:end inEditor:editor];
+	long line = [editor message:SCI_LINEFROMPOSITION wParam:(uptr_t)start lParam:0];
+	[self setStatusText:[NSString stringWithFormat:@"Match on line %ld.", line + 1]];
+}
+
 - (void)findNext:(id)sender {
 	(void)sender;
+	if (_workspace.resultsVisible) {
+		[self hideFindInFiles:nil];
+	}
 	_workspace.findVisible = YES;
 	[_workspace layoutPanes];
-	long found = NppFind([self activeEditor], _findField.stringValue, true, _wrap.state == NSControlStateValueOn, [self searchFlags]);
-	[self noteSearch:_findField.stringValue inEditor:[self activeEditor]];
-	[self setStatusText:found < 0 ? @"No match." : @"Match found."];
+	ScintillaView *editor = [self activeEditor];
+	long found = NppFind(editor, _findField.stringValue, true, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	[self reportFind:found inEditor:editor];
 }
 
 - (void)findPrevious:(id)sender {
 	(void)sender;
-	long found = NppFind([self activeEditor], _findField.stringValue, false, _wrap.state == NSControlStateValueOn, [self searchFlags]);
-	[self noteSearch:_findField.stringValue inEditor:[self activeEditor]];
-	[self setStatusText:found < 0 ? @"No match." : @"Match found."];
+	if (_workspace.resultsVisible) {
+		[self hideFindInFiles:nil];
+	}
+	_workspace.findVisible = YES;
+	[_workspace layoutPanes];
+	ScintillaView *editor = [self activeEditor];
+	long found = NppFind(editor, _findField.stringValue, false, _wrap.state == NSControlStateValueOn, [self searchFlags]);
+	[self reportFind:found inEditor:editor];
 }
 
 - (void)replaceNext:(id)sender {
@@ -5803,6 +5865,16 @@ static NSString *NppMenuSymbol(NSString *title) {
 }
 
 - (void)documentTabDidChange:(DocumentTab *)tab {
+	if (_findMarkEditor && tab.editor == _findMarkEditor) {
+		long start = [tab.editor message:SCI_GETSELECTIONSTART];
+		long end = [tab.editor message:SCI_GETSELECTIONEND];
+		if (start != _findMarkStart || end != _findMarkEnd) {
+			_findMarkEditor = nil;
+			_findMarkStart = -1;
+			_findMarkEnd = -1;
+			NppClearSearchHighlights(tab.editor);
+		}
+	}
 	if (tab == [self currentDocument]) {
 		[self refreshStatus];
 	}
@@ -5851,8 +5923,11 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)showAbout:(id)sender {
 	(void)sender;
 	NSAlert *alert = [NSAlert new];
+	NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+	NSString *version = info[@"CFBundleShortVersionString"] ?: @"?";
+	NSString *build = info[@"CFBundleVersion"] ?: @"?";
 	alert.messageText = @"Simeiomatarion";
-	alert.informativeText = @"Text editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.";
+	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.", version, build];
 	[alert runModal];
 }
 
