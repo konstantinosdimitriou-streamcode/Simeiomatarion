@@ -53,6 +53,7 @@ long NppFind(ScintillaView *editor, NSString *text, bool forward, bool wrap, Sea
 }
 
 static const int kSearchIndicator = 9;
+static const int kCurrentMatchIndicator = 10;
 
 void NppClearSearchHighlights(ScintillaView *editor) {
 	if (!editor) {
@@ -61,6 +62,34 @@ void NppClearSearchHighlights(ScintillaView *editor) {
 	long length = [editor message:SCI_GETLENGTH];
 	[editor message:SCI_SETINDICATORCURRENT wParam:kSearchIndicator lParam:0];
 	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+	[editor message:SCI_SETINDICATORCURRENT wParam:kCurrentMatchIndicator lParam:0];
+	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+}
+
+void NppShowCurrentMatch(ScintillaView *editor, long start, long end) {
+	if (!editor) {
+		return;
+	}
+	long length = [editor message:SCI_GETLENGTH];
+	[editor message:SCI_INDICSETSTYLE wParam:kCurrentMatchIndicator lParam:INDIC_FULLBOX];
+	[editor message:SCI_INDICSETFORE wParam:kCurrentMatchIndicator lParam:0x0095FF];
+	[editor message:SCI_INDICSETALPHA wParam:kCurrentMatchIndicator lParam:170];
+	[editor message:SCI_INDICSETUNDER wParam:kCurrentMatchIndicator lParam:1];
+	[editor message:SCI_SETINDICATORCURRENT wParam:kCurrentMatchIndicator lParam:0];
+	[editor message:SCI_INDICATORCLEARRANGE wParam:0 lParam:length];
+	if (start < 0 || end <= start) {
+		return;
+	}
+	[editor message:SCI_INDICATORFILLRANGE wParam:static_cast<uptr_t>(start) lParam:end - start];
+	long line = [editor message:SCI_LINEFROMPOSITION wParam:static_cast<uptr_t>(start) lParam:0];
+	[editor message:SCI_ENSUREVISIBLE wParam:static_cast<uptr_t>(line) lParam:0];
+	[editor message:SCI_SCROLLCARET];
+	long visible = [editor message:SCI_LINESONSCREEN];
+	long top = visible > 2 ? line - visible / 3 : 0;
+	if (top < 0) {
+		top = 0;
+	}
+	[editor message:SCI_SETFIRSTVISIBLELINE wParam:static_cast<uptr_t>(top) lParam:0];
 }
 
 void NppHighlightMatches(ScintillaView *editor, NSString *text, SearchFlags flags) {
