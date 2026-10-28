@@ -1,0 +1,104 @@
+# Codemagic: Simeiomatarion for the Mac App Store (arm64, App Sandbox), uploaded to
+# App Store Connect only. No automatic triggers: builds start by hand or by API.
+# Review submission is a separate, manual step in App Store Connect.
+workflows:
+  macos-appstore:
+    name: Simeiomatarion Mac App Store
+    instance_type: mac_mini_m2
+    max_build_duration: 25
+    environment:
+      groups:
+        - mac_signing   # MAC_DISTRIBUTION_P12_*, MAC_INSTALLER_P12_*, MAC_APPSTORE_PROFILE_BASE64, APP_STORE_CONNECT_*
+      vars:
+        BUNDLE_ID: gr.streamcode.simeiomatarion
+        TEAM_ID: 3TT4T4UCVR
+        APP_STORE_APPLE_ID: 6827997164
+        APP_SIGN_IDENTITY: "Apple Distribution: STREAMCODE LP (3TT4T4UCVR)"
+        PKG_SIGN_IDENTITY: "3rd Party Mac Developer Installer: STREAMCODE LP (3TT4T4UCVR)"
+        APP_PATH: macos/build/appstore/Simeiomatarion.app
+        PKG_PATH: macos/build/appstore/Simeiomatarion.pkg
+      xcode: latest
+    scripts:
+      - name: Toolchain
+        script: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          sw_vers
+      - name: Signing files
+        script: |
+          set -euo pipefail
+          keychain initialize
+          echo "$MAC_DISTRIBUTION_P12_BASE64" | base64 --decode > /tmp/dist.p12
+          echo "$MAC_INSTALLER_P12_BASE64" | base64 --decode > /tmp/inst.p12
+          keychain add-certificates --certificate /tmp/dist.p12 --certificate-password "$MAC_DISTRIBUTION_P12_PASSWORD"
+          keychain add-certificates --certificate /tmp/inst.p12 --certificate-password "$MAC_INSTALLER_P12_PASSWORD"
+          rm -f /tmp/dist.p12 /tmp/inst.p12
+          echo "$MAC_APPSTORE_PROFILE_BASE64" | base64 --decode > /tmp/embedded.provisionprofile
+          security cms -D -i /tmp/embedded.provisionprofile > /tmp/profile.plist
+          /usr/libexec/PlistBuddy -c "Print :Name" -c "Print :Entitlements:com.apple.application-identifier" /tmp/profile.plist
+          security find-identity -v
+      - name: Fetch upstream engine source
+        script: |
+          set -euo pipefail
+          ./scripts/fetch-upstream.sh
+      - name: Build and test (FLAVOR=appstore)
+        script: |
+          set -euo pipefail
+          cd macos
+          make -j"$(sysctl -n hw.ncpu)" FLAVOR=appstore SIGN_IDENTITY="$APP_SIGN_IDENTITY" TEAM_ID="$TEAM_ID" test
+      - name: Embed profile, add build metadata, re-sign, check
+        script: |
+          set -euo pipefail
+          PLIST="$APP_PATH/Contents/Info.plist"
+          cp /tmp/embedded.provisionprofile "$APP_PATH/Contents/embedded.provisionprofile"
+          # The same toolchain keys Xcode writes; App Store Connect reads them for the SDK check.
+          XCODE_VERSION=$(xcodebuild -version | awk 'NR==1 {print $2}')
+          XCODE_BUILD=$(xcodebuild -version | awk 'NR==2 {print $3}')
+          IFS=. read -r XC_MAJOR XC_MINOR XC_PATCH _ <<< "$XCODE_VERSION.0.0"
+          DTXCODE=$(printf '%02d%d%d' "$XC_MAJOR" "${XC_MINOR:-0}" "${XC_PATCH:-0}")
+          SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
+          SDK_BUILD=$(xcrun --sdk macosx --show-sdk-build-version)
+          for key in DTXcode DTXcodeBuild DTSDKName DTSDKBuild DTPlatformName DTPlatformVersion DTPlatformBuild DTCompiler BuildMachineOSBuild CFBundleSupportedPlatforms; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$PLIST" 2>/dev/null || true
+          done
+          /usr/libexec/PlistBuddy \
+            -c "Add :DTXcode string $DTXCODE" \
+            -c "Add :DTXcodeBuild string $XCODE_BUILD" \
+            -c "Add :DTSDKName string macosx$SDK_VERSION" \
+            -c "Add :DTSDKBuild string $SDK_BUILD" \
+            -c "Add :DTPlatformName string macosx" \
+            -c "Add :DTPlatformVersion string $SDK_VERSION" \
+            -c "Add :DTPlatformBuild string $SDK_BUILD" \
+            -c "Add :DTCompiler string com.apple.compilers.llvm.clang.1_0" \
+            -c "Add :BuildMachineOSBuild string $(sw_vers -buildVersion)" \
+            -c "Add :CFBundleSupportedPlatforms array" \
+            -c "Add :CFBundleSupportedPlatforms:0 string MacOSX" \
+            "$PLIST"
+          plutil -lint "$PLIST"
+          codesign --force --options runtime --timestamp \
+            --entitlements macos/build/appstore/Simeiomatarion.entitlements \
+            --sign "$APP_SIGN_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign -dvv "$APP_PATH" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|Runtime)'
+          codesign -d --entitlements - --xml "$APP_PATH" > /tmp/app-entitlements.plist
+          plutil -p /tmp/app-entitlements.plist
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' /tmp/app-entitlements.plist)" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' /tmp/app-entitlements.plist)" = "$TEAM_ID.$BUNDLE_ID"
+          test "$(plutil -extract CFBundleIdentifier raw "$PLIST")" = "$BUNDLE_ID"
+          test "$(plutil -extract CFBundleShortVersionString raw "$PLIST")" = "$(tr -d '[:space:]' < VERSION)"
+          test "$(plutil -extract CFBundleVersion raw "$PLIST")" = "$(tr -d '[:space:]' < BUILD_NUMBER)"
+          echo "version $(plutil -extract CFBundleShortVersionString raw "$PLIST") ($(plutil -extract CFBundleVersion raw "$PLIST"))"
+          lipo -info "$APP_PATH/Contents/MacOS/Simeiomatarion"
+      - name: Package .pkg
+        script: |
+          set -euo pipefail
+          productbuild --component "$APP_PATH" /Applications --sign "$PKG_SIGN_IDENTITY" "$PKG_PATH"
+          pkgutil --check-signature "$PKG_PATH"
+          ls -l "$PKG_PATH"
+      - name: Upload to App Store Connect (no review submission)
+        script: |
+          set -euo pipefail
+          app-store-connect publish --path "$PKG_PATH"
+    artifacts:
+      - macos/build/appstore/Simeiomatarion.pkg
