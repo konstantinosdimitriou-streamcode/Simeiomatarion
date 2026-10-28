@@ -6918,7 +6918,8 @@ static NSString *const kSourceURL = @"https://github.com/konstantinosdimitriou-s
 	title.stringValue = path.lastPathComponent.length ? path.lastPathComponent : path;
 	title.toolTip = path;
 	NSTextField *pathField = [_sidebar viewWithTag:2];
-	pathField.stringValue = path;
+	// Show home-relative paths as ~/… (inside the App Sandbox, ~ is the app container).
+	pathField.stringValue = path.stringByAbbreviatingWithTildeInPath;
 	pathField.toolTip = path;
 	[_folderOutline reloadData];
 	[_folderOutline expandItem:nil expandChildren:NO];
@@ -6966,7 +6967,7 @@ static NSString *const kSourceURL = @"https://github.com/konstantinosdimitriou-s
 	path = path.stringByStandardizingPath;
 	BOOL directory = NO;
 	if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&directory]) {
-		pathField.stringValue = _folderRoot ?: @"";
+		pathField.stringValue = _folderRoot.stringByAbbreviatingWithTildeInPath ?: @"";
 		[self alert:@"That path does not exist."];
 		return;
 	}
