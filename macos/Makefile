@@ -4,6 +4,14 @@ CC := clang
 SDK := $(shell xcrun --show-sdk-path)
 MIN := 12.0
 UP := ../upstream
+# Fetch the pinned third-party source tree on first build (see NOTICE).
+ifeq ($(wildcard $(UP)/scintilla/src/Editor.cxx),)
+$(info upstream/ missing, running ../scripts/fetch-upstream.sh)
+FETCH_STATUS := $(shell ../scripts/fetch-upstream.sh >&2; echo $$?)
+ifneq ($(FETCH_STATUS),0)
+$(error scripts/fetch-upstream.sh failed)
+endif
+endif
 SYS := -arch $(ARCH) -isysroot "$(SDK)" -mmacosx-version-min=$(MIN)
 CXXFLAGS := $(SYS) -std=c++17 -O2
 THIRD_FLAGS := $(CXXFLAGS) -w -DNDEBUG
@@ -41,7 +49,7 @@ TEST_OBJ := build/obj/app/port_tests.o build/obj/app/Encoding.o build/obj/app/La
 version:
 	@echo "$(VERSION) ($(BUILD_NUMBER))"
 
-all: $(APP)/Contents/MacOS/NotepadPlusPlus $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin build/port_tests
+all: $(APP)/Contents/MacOS/Simeiomatarion $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo resources plugin build/port_tests
 	codesign --force --sign - $(APP)
 
 build/obj/sci/%.o: $(UP)/scintilla/src/%.cxx
@@ -80,7 +88,7 @@ build/obj/app/port_tests.o: tests/port_tests.mm
 	@mkdir -p $(dir $@)
 	$(CXX) $(OBJCXX) $(APP_INCLUDES) -c $< -o $@
 
-$(APP)/Contents/MacOS/NotepadPlusPlus: $(APP_OBJ) $(ENGINE_OBJ)
+$(APP)/Contents/MacOS/Simeiomatarion: $(APP_OBJ) $(ENGINE_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(SYS) -fobjc-arc $^ -framework Cocoa -framework QuartzCore -framework CoreFoundation -framework WebKit -framework PDFKit -liconv -lz -o $@
 
@@ -98,7 +106,7 @@ $(APP)/Contents/PkgInfo:
 	@mkdir -p $(APP)/Contents
 	printf 'APPL????' > $@
 
-ICON_SRC := resources/AppIcon.jpg
+ICON_SRC := resources/AppIcon.png
 ICONSET := build/AppIcon.iconset
 
 $(APP)/Contents/Resources/AppIcon.icns: $(ICON_SRC)
@@ -118,8 +126,13 @@ $(APP)/Contents/Resources/AppIcon.icns: $(ICON_SRC)
 
 resources: $(APP)/Contents/Info.plist $(APP)/Contents/Resources/AppIcon.icns
 	@mkdir -p $(APP)/Contents/Resources
-	cp $(UP)/PowerEditor/src/langs.model.xml $(APP)/Contents/Resources/langs.model.xml
-	cp $(UP)/PowerEditor/src/stylers.model.xml $(APP)/Contents/Resources/stylers.model.xml
+	cp resources/PrivacyInfo.xcprivacy $(APP)/Contents/Resources/PrivacyInfo.xcprivacy
+	cp ../LICENSE $(APP)/Contents/Resources/LICENSE
+	cp ../NOTICE $(APP)/Contents/Resources/NOTICE
+	# Same files as upstream, with the XML root element renamed. Lookups use //Language and //LexerType.
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/langs.model.xml > $(APP)/Contents/Resources/langs.model.xml
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/stylers.model.xml > $(APP)/Contents/Resources/stylers.model.xml
+	xmllint --noout $(APP)/Contents/Resources/langs.model.xml $(APP)/Contents/Resources/stylers.model.xml
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_busy.png --out $(APP)/Contents/Resources/mac_cursor_busy.tiff >/dev/null
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_flipped.png --out $(APP)/Contents/Resources/mac_cursor_flipped.tiff >/dev/null
 

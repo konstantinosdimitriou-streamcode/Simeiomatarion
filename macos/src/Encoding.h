@@ -6,7 +6,7 @@
 
 // Line-ending values match Scintilla's SC_EOL_CRLF, SC_EOL_CR, and SC_EOL_LF.
 // Values 0–4 stay stable for documents saved by earlier builds. Later ids are
-// the rest of the Notepad++ Encoding menu and live in the table in Encoding.cc.
+// the rest of the Encoding menu and live in the table in Encoding.cc.
 enum NppTextEncoding {
 	kEncodingUTF8 = 0,
 	kEncodingUTF8BOM = 1,

@@ -35,7 +35,7 @@ void NppShowCurrentMatch(ScintillaView *editor, long start, long end);
 @property (nonatomic, copy) NSString *error;
 @end
 
-// Directory search used by Notepad++ Find in Files. "*.*" matches every file name.
+// Directory search used by Find in Files. "*.*" matches every file name.
 NSArray<NppFindHit *> *NppFindInFiles(NSString *directory, NSString *query, NSString *filters, BOOL subfolders, SearchFlags flags, NSInteger limit);
 
 @interface NppFindScan : NSObject

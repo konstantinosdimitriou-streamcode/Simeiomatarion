@@ -5,8 +5,8 @@
 @implementation EditorSettings
 
 + (NSDictionary<NSString *, NSString *> *)defaultShortcuts {
-	// Notepad++ Ctrl/Alt accelerators, with Command standing in for Ctrl.
-	// Command-Q stays Quit, so the Notepad++ comment shortcut stays Control-Q.
+	// Default Ctrl/Alt accelerators, with Command standing in for Ctrl.
+	// Command-Q stays Quit, so the comment shortcut stays Control-Q.
 	// Command-H stays Hide, so Replace keeps Command-Option-F. Control-H also opens Replace.
 	return @{
 		@"new": @"cmd+n",
