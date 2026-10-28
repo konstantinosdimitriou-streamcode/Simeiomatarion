@@ -129,8 +129,10 @@ resources: $(APP)/Contents/Info.plist $(APP)/Contents/Resources/AppIcon.icns
 	cp resources/PrivacyInfo.xcprivacy $(APP)/Contents/Resources/PrivacyInfo.xcprivacy
 	cp ../LICENSE $(APP)/Contents/Resources/LICENSE
 	cp ../NOTICE $(APP)/Contents/Resources/NOTICE
-	cp $(UP)/PowerEditor/src/langs.model.xml $(APP)/Contents/Resources/langs.model.xml
-	cp $(UP)/PowerEditor/src/stylers.model.xml $(APP)/Contents/Resources/stylers.model.xml
+	# Same files as upstream, with the XML root element renamed. Lookups use //Language and //LexerType.
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/langs.model.xml > $(APP)/Contents/Resources/langs.model.xml
+	sed -E 's#<(/?)NotepadPlus([ >])#<\1Simeiomatarion\2#' $(UP)/PowerEditor/src/stylers.model.xml > $(APP)/Contents/Resources/stylers.model.xml
+	xmllint --noout $(APP)/Contents/Resources/langs.model.xml $(APP)/Contents/Resources/stylers.model.xml
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_busy.png --out $(APP)/Contents/Resources/mac_cursor_busy.tiff >/dev/null
 	sips -s format tiff $(UP)/scintilla/cocoa/res/mac_cursor_flipped.png --out $(APP)/Contents/Resources/mac_cursor_flipped.tiff >/dev/null
 
