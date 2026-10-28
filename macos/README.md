@@ -18,6 +18,26 @@ open "build/Simeiomatarion.app"
 
 `make test` also runs `build/port_tests`.
 
+## Flavours and signing
+
+| | `developer` (default) | `appstore` |
+| --- | --- | --- |
+| Build | `./build.sh` → `build/Simeiomatarion.app` | `FLAVOR=appstore ./build.sh` → `build/appstore/Simeiomatarion.app` |
+| Distribution | Developer ID, notarized download | Mac App Store |
+| App Sandbox | No | Yes (`Simeiomatarion.entitlements`) |
+| Plugins | Bundled, plus dylibs in `~/Library/Application Support/Simeiomatarion/plugins` | Bundled `Contents/PlugIns` only |
+| New Window / tab to new window | Yes (second app instance) | Hidden |
+| File access | Any path | Files and folders the user opened, dropped or chose; kept across launches with security-scoped bookmarks. Find in Files asks for the folder when it has no access. |
+
+Every build signs the bundled plugins and then the app with the hardened runtime. The signature is ad-hoc unless you pass an identity:
+
+```sh
+make FLAVOR=developer SIGN_IDENTITY="Developer ID Application: …"
+make FLAVOR=appstore SIGN_IDENTITY="Apple Distribution: …" TEAM_ID=XXXXXXXXXX
+```
+
+`TEAM_ID` adds the `application-identifier` and `team-identifier` entitlements from `Simeiomatarion.appstore-team.entitlements.in`. The developer flavour uses `Simeiomatarion.developer.entitlements` (library validation off, so user plugins load).
+
 ## Version
 
 The version has one source of truth at the repository root:
@@ -49,7 +69,7 @@ To bump the version:
 - Session restore, and recovery of dirty buffers every 30 seconds
 - A native plugin (`PlugIns/SamplePlugin.dylib`, Plugins → Uppercase Selection)
 
-Settings, macros, recovery files, and extra plugins live in `~/Library/Application Support/Simeiomatarion/`. On first launch, settings from the folder used by builds before 1.0.0 are copied there. Drop extra `dylib` files in the `plugins` folder there.
+Settings, macros, recovery files, and extra plugins live in `~/Library/Application Support/Simeiomatarion/`. On first launch, settings from the folder used by builds before 1.0.0 are copied there. Drop extra `dylib` files in the `plugins` folder there (developer flavour only).
 
 ## License
 
