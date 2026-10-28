@@ -1,12 +1,18 @@
 # Simeiomatarion
 
-Native arm64 macOS application. It is a GPL-3 derivative of [Notepad++ 8.9.8.1](https://notepad-plus-plus.org/downloads/v8.9.8.1/). The official source is in `../upstream` (tag `v8.9.8.1`, commit `dd40fe45598791e9aa38f3aeb200e10fb3d6338a`).
+Simeiomatarion is a native text and code editor for Apple Silicon Macs: tabs, side-by-side panes, syntax highlighting for dozens of languages, regular-expression search, and table and document views for CSV, PDF and Word files.
 
-The Windows shell in `PowerEditor` is Win32 and cannot be compiled on macOS. This port keeps the editing engine from that release and replaces the shell with AppKit.
+Simeiomatarion is based on Notepad++ source code under GPL-3. It is not affiliated with or endorsed by the Notepad++ project.
 
 ## Build
 
 Command Line Tools are enough. Full Xcode is not required.
+
+The build compiles the editing engine from the upstream source, which is not stored in this repository. Put it in `upstream/` at the repository root (tag `v8.9.8.1`, commit `dd40fe45598791e9aa38f3aeb200e10fb3d6338a`):
+
+```sh
+git clone --depth 1 --branch v8.9.8.1 https://github.com/notepad-plus-plus/notepad-plus-plus.git upstream
+```
 
 Run this from the repository root.
 
@@ -38,9 +44,9 @@ To bump the version:
 
 - Edit several documents in tabs
 - Drag one or more files onto the window, or onto the Dock icon, to open each in a tab
-- Syntax highlighting and code folding through Lexilla, using `langs.model.xml` from this Notepad++ release
+- Syntax highlighting and code folding through Lexilla, using the upstream `langs.model.xml`
 - Find, find previous, replace, and replace all
-- Regular expressions through the same Boost.Regex search Notepad++ uses (`SCFIND_REGEXP | SCFIND_POSIX`)
+- Regular expressions through Boost.Regex (`SCFIND_REGEXP | SCFIND_POSIX`)
 - Record, stop, play, and persist one macro
 - UTF-8, UTF-8 with BOM, UTF-16 LE, UTF-16 BE, and Windows-1252
 - CRLF, CR, and LF, including conversion
@@ -53,4 +59,4 @@ Settings, macros, recovery files, and extra plugins live in `~/Library/Applicati
 
 ## License
 
-Notepad++ is GPL-3. See `../upstream/LICENSE`. Scintilla and Lexilla keep their own licenses in the upstream tree. This macOS shell is covered by the same GPL-3 terms as the Notepad++ work it is derived from.
+GPL-3.0. See [`LICENSE`](../LICENSE). Simeiomatarion is based on Notepad++ source code under GPL-3. It is not affiliated with or endorsed by the Notepad++ project. The editing engine uses Scintilla and Lexilla, which keep their own licenses in the upstream tree.
