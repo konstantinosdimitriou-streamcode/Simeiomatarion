@@ -46,7 +46,12 @@ workflows:
         script: |
           set -euo pipefail
           cd macos
-          make -j"$(sysctl -n hw.ncpu)" FLAVOR=appstore SIGN_IDENTITY="$APP_SIGN_IDENTITY" TEAM_ID="$TEAM_ID" test
+          make -j"$(sysctl -n hw.ncpu)" FLAVOR=appstore SIGN_IDENTITY="$APP_SIGN_IDENTITY" TEAM_ID="$TEAM_ID" all
+          # port_tests loads the plugins from build/Simeiomatarion.app (the developer path);
+          # point that path at the App Store bundle so the tests run against the plugins we ship.
+          ln -sfn appstore/Simeiomatarion.app build/Simeiomatarion.app
+          ./build/appstore/port_tests ../upstream/PowerEditor/src/langs.model.xml
+          rm build/Simeiomatarion.app
       - name: Embed profile, add build metadata, re-sign, check
         script: |
           set -euo pipefail
@@ -81,7 +86,7 @@ workflows:
             --sign "$APP_SIGN_IDENTITY" "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           codesign -dvv "$APP_PATH" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|Runtime)'
-          codesign -d --entitlements - --xml "$APP_PATH" > /tmp/app-entitlements.plist
+          codesign -d --entitlements - --xml "$APP_PATH" > /tmp/app-entitlements.plist 2>/dev/null || codesign -d --entitlements :- "$APP_PATH" > /tmp/app-entitlements.plist
           plutil -p /tmp/app-entitlements.plist
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' /tmp/app-entitlements.plist)" = true
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' /tmp/app-entitlements.plist)" = "$TEAM_ID.$BUNDLE_ID"
