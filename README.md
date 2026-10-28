@@ -2,14 +2,16 @@
 
 Simeiomatarion is a native text and code editor for Apple Silicon Macs: tabs, side-by-side panes, syntax highlighting for dozens of languages, regular-expression search, and table and document views for CSV, PDF and Word files.
 
-![Simeiomatarion editing a C++ file with syntax highlighting, code folding, tabs and the folder sidebar](docs/screenshots/editor.png)
+![Simeiomatarion editing a Python file with syntax highlighting, code folding, tabs, the folder sidebar and the minimap](docs/screenshots/editor.png)
 
 ## Screenshots
 
 | | |
 | --- | --- |
-| ![Two panes side by side, a Python file on the left and a JavaScript file on the right, each with its own tabs](docs/screenshots/split-view.png) | ![A CSV file shown as a table with column headers](docs/screenshots/csv-table.png) |
-| Two panes side by side, each with its own tabs | A CSV file opened as a table |
+| ![Two panes side by side, a Python file on the left and a Go file on the right, each with its own tabs](docs/screenshots/split-view.png) | ![A CSV file shown as an editable table with column headers](docs/screenshots/csv-table.png) |
+| Two panes side by side, each with its own tabs | A CSV file opened as an editable table |
+| ![The editor with its menus and toolbar in Greek, showing a Markdown file](docs/screenshots/greek-ui.png) | |
+| The interface in Greek | |
 
 ## Build
 
