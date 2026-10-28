@@ -5923,8 +5923,11 @@ static NSString *NppMenuSymbol(NSString *title) {
 - (void)showAbout:(id)sender {
 	(void)sender;
 	NSAlert *alert = [NSAlert new];
+	NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+	NSString *version = info[@"CFBundleShortVersionString"] ?: @"?";
+	NSString *build = info[@"CFBundleVersion"] ?: @"?";
 	alert.messageText = @"Simeiomatarion";
-	alert.informativeText = @"Text editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.";
+	alert.informativeText = [NSString stringWithFormat:@"Version %@ (%@)\n\nText editor for Apple Silicon.\n\nIncludes code from Notepad++ 8.9.8.1, Copyright 2021 Don HO and contributors. GPL-3. Scintilla 5.6.6 and Lexilla 5.5.3.", version, build];
 	[alert runModal];
 }
 

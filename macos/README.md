@@ -8,21 +8,31 @@ The Windows shell in `PowerEditor` is Win32 and cannot be compiled on macOS. Thi
 
 Command Line Tools are enough. Full Xcode is not required.
 
-Run this from any directory. The project path contains spaces, so keep the quotes.
+Run this from the repository root.
 
 ```sh
-cd "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos"
+cd macos
 ./build.sh
 open "build/Simeiomatarion.app"
 ```
 
-Or, without rebuilding:
-
-```sh
-open "/Users/konstantinosdimitriou/Documents/GitHub/notepad Plus plus/macos/build/Simeiomatarion.app"
-```
-
 `make test` also runs `build/port_tests`.
+
+## Version
+
+The version has one source of truth at the repository root:
+
+- `VERSION` holds the app version as `MAJOR.MINOR.PATCH` (semver). It becomes `CFBundleShortVersionString`.
+- `BUILD_NUMBER` holds a positive integer. It becomes `CFBundleVersion`.
+
+`macos/Info.plist` holds the placeholders `@VERSION@` and `@BUILD_NUMBER@`. The Makefile fills them in when it copies the plist into the app, and the About box reads the values from the bundle. `make version` prints the current values. `make BUILD_NUMBER=42` overrides the build number for one build without editing the file.
+
+To bump the version:
+
+1. Change `VERSION`: patch for fixes, minor for new features, major for breaking changes.
+2. Increase `BUILD_NUMBER` by one. It must go up for every build you ship, including rebuilds of the same version.
+3. Move the `## [Unreleased]` notes in `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading and add the compare link at the bottom.
+4. Open a PR to `dev`. After the release is merged into `main`, tag it `vx.y.z`.
 
 ## What you can do
 
